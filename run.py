@@ -14,6 +14,7 @@ Usage:
 Outputs:
     Prints summary tables to terminal.
     With --output csv: saves trades + stats to output/<persona>_<year>_*.csv
+    With --enrich: adds underlying/IV context columns from src/enricher.py
 """
 
 import argparse
@@ -180,6 +181,8 @@ def main():
                         help="Side-by-side comparison of all personas")
     parser.add_argument("--output", choices=["csv"], default=None,
                         help="Save results to output/ directory")
+    parser.add_argument("--enrich", action="store_true",
+                        help="Enrich trades with underlying price + IV context")
     parser.add_argument("--data-dir", default=DATA_DIR,
                         help=f"Root data directory (default: {DATA_DIR})")
     args = parser.parse_args()
@@ -189,6 +192,10 @@ def main():
         return
 
     trades, raw = analyze(args.persona, data_dir=args.data_dir)
+    if args.enrich:
+        from src.enricher import enrich
+        trades = enrich(trades)
+
     print_section(trades, args.persona, args.year)
 
     if args.output == "csv":
