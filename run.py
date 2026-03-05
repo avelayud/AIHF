@@ -45,17 +45,21 @@ def print_section(trades: pd.DataFrame, persona: str, year_filter: int | None):
     if year_filter:
         trades = trades[trades["year"] == year_filter]
 
-    closed = trades[trades["outcome"].isin(["WIN", "LOSS", "EXPIRED_WIN", "ASSIGNED"])]
-    total_premium = trades["premium_collected"].sum()
-    total_pnl = trades["net_pnl"].sum()
-    n_closed = len(closed)
-    wins = closed["outcome"].isin(["WIN", "EXPIRED_WIN"]).sum()
-    wr = wins / n_closed * 100 if n_closed else 0
+    resolved = trades[trades["outcome"].isin(["WIN", "LOSS", "EXPIRED_WIN"])]
+    total_premium = resolved["premium_collected"].sum()
+    total_pnl = resolved["net_pnl"].sum()
+    n_resolved = len(resolved)
+    wins = resolved["outcome"].isin(["WIN", "EXPIRED_WIN"]).sum()
+    wr = wins / n_resolved * 100 if n_resolved else 0
+    avg_trade_return = resolved["pnl_pct"].mean()
+    avg_notional_return = resolved["return_on_notional_pct"].mean()
 
-    print(f"\n  {'Total trades (closed):':28} {n_closed}")
-    print(f"  {'Overall win rate:':28} {wr:.1f}%")
-    print(f"  {'Total premium collected:':28} ${total_premium:,.0f}")
-    print(f"  {'Net P&L (closed trades):':28} ${total_pnl:,.0f}")
+    print(f"\n  {'Resolved option trades:':28} {n_resolved}")
+    print(f"  {'Win rate (resolved only):':28} {wr:.1f}%")
+    print(f"  {'Premium (resolved trades):':28} ${total_premium:,.0f}")
+    print(f"  {'Net P&L (resolved trades):':28} ${total_pnl:,.0f}")
+    print(f"  {'Avg return / trade:':28} {avg_trade_return:.2f}%")
+    print(f"  {'Avg return on notional:':28} {avg_notional_return:.3f}%")
     print(f"  {'Open positions:':28} {(trades['outcome']=='OPEN').sum()}")
     print(f"  {'Assignments:':28} {(trades['outcome']=='ASSIGNED').sum()}")
 

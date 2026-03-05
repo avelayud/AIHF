@@ -1,28 +1,25 @@
 """
-parser.py — Fidelity CSV → clean structured DataFrame
+parser.py — Load Fidelity exports into a normalized DataFrame.
 
-Handles:
-  - Multi-year files (2024, 2025, 2026 YTD)
-  - Multi-persona dirs (Arjuna/, Sundar/, ...)
-  - BOM, blank rows, Fidelity footer disclaimers
-  - CORR/CXL correction pairs (flagged, not double-counted)
+Supports:
+- Closed Positions exports (new primary source)
+- Activity exports (legacy fallback)
 """
 
+from __future__ import annotations
+
 import re
-import pandas as pd
 from io import StringIO
 from pathlib import Path
 
-
-# ── Ticker Universe ────────────────────────────────────────────────────────────
+import pandas as pd
 
 UNIVERSE = {
-    "tech_core":         ["NVDA", "AMD", "GOOGL", "GOOG", "META", "AMZN",
-                          "AAPL", "TSLA", "ORCL", "MSFT", "CRM"],
-    "tech_growth":       ["CRWV", "HOOD", "PLTR", "RDDT", "FIG"],
-    "leveraged":         ["TQQQ", "SOXL", "UPRO", "SPXL", "QQQ", "SPY"],
+    "tech_core": ["NVDA", "AMD", "GOOGL", "GOOG", "META", "AMZN", "AAPL", "TSLA", "ORCL", "MSFT", "CRM"],
+    "tech_growth": ["CRWV", "HOOD", "PLTR", "RDDT", "FIG"],
+    "leveraged": ["TQQQ", "SOXL", "UPRO", "SPXL", "QQQ", "SPY"],
     "long_term_quality": ["COST", "UNH", "BRK", "BRKB", "V", "MA", "JPM", "WMT"],
-    "crypto_proxy":      ["IBIT", "MSTR", "COIN"],
+    "crypto_proxy": ["IBIT", "MSTR", "COIN"],
 }
 
 TICKER_SECTOR: dict[str, str] = {}
@@ -32,117 +29,28 @@ for _sector, _tickers in UNIVERSE.items():
 
 
 def get_sector(ticker: str) -> str:
-    return TICKER_SECTOR.get(ticker.upper(), "other")
-
-
-# ── File Loading ───────────────────────────────────────────────────────────────
-
-def _load_raw(path: Path) -> pd.DataFrame:
-    with open(path, encoding="utf-8-sig", errors="replace") as f:
-        lines = f.readlines()
-
-    header_idx = next(
-        (i for i, l in enumerate(lines) if "Run Date" in l), None
-    )
-    if header_idx is None:
-        raise ValueError(f"No 'Run Date' header found in {path}")
-
-    footer_idx = next(
-        (i for i, l in enumerate(lines) if "The data and information" in l),
-        len(lines),
-    )
-
-    data = "".join(lines[header_idx:footer_idx])
-    df = pd.read_csv(StringIO(data), dtype=str)
-    df = df.dropna(how="all")
-    df = df[df["Run Date"].notna() & (df["Run Date"].str.strip() != "")]
-    df["source_file"] = path.name
-    return df
-
-
-def load_persona(persona: str, data_dir: str = "tradingData") -> pd.DataFrame:
-    """
-    Load + parse all CSV files for a persona.
-
-    Args:
-        persona:  "Arjuna" | "Sundar" | "all"
-        data_dir: folder containing persona sub-dirs
-    """
-    root = Path(data_dir)
-
-    if persona.lower() == "all":
-        dirs = sorted([d for d in root.iterdir() if d.is_dir()])
-    else:
-        dirs = [root / persona]
-
-    frames = []
-    for d in dirs:
-        if not d.exists():
-            print(f"  [WARN] Not found: {d}")
-            continue
-        for csv_path in sorted(d.glob("*.csv")):
-            print(f"  Loading {csv_path.relative_to(root)}")
-            raw = _load_raw(csv_path)
-            raw["persona"] = d.name
-            frames.append(raw)
-
-    if not frames:
-        raise FileNotFoundError(f"No data loaded for persona '{persona}'")
-
-    df = pd.concat(frames, ignore_index=True)
-    return _parse(df)
-
-
-# ── Field Parsing ──────────────────────────────────────────────────────────────
-
-def _categorize_action(action: str) -> str:
-    a = str(action).upper()
-    if "CORR DESCRIPTION" in a or "CXL DESCRIPTION" in a:
-        return "CORRECTION"          # corrected/cancelled entries — exclude from analysis
-    if "SOLD OPENING" in a:          return "SELL_OPEN"
-    if "BOUGHT CLOSING" in a:        return "BUY_CLOSE"
-    if "BOUGHT OPENING" in a:        return "BUY_OPEN"
-    if "SOLD CLOSING" in a:          return "SELL_CLOSE"
-    if "EXPIRED" in a:               return "EXPIRED"
-    if "ASSIGNED" in a:              return "ASSIGNED"
-    if "DIVIDEND" in a:              return "DIVIDEND"
-    if "REINVESTMENT" in a:          return "REINVESTMENT"
-    if "ELECTRONIC FUNDS" in a:      return "TRANSFER"
-    if "TRANSFERRED" in a:           return "TRANSFER"
-    if "YOU SOLD" in a:              return "STOCK_SELL"
-    if "YOU BOUGHT" in a:            return "STOCK_BUY"
-    return "OTHER"
-
-
-def _get_opt_type(action: str) -> str:
-    a = str(action).upper()
-    if " PUT " in a or a.endswith("PUT"):   return "PUT"
-    if " CALL " in a or a.endswith("CALL"): return "CALL"
-    return None
+    return TICKER_SECTOR.get(str(ticker).upper(), "other")
 
 
 def _extract_ticker(symbol: str) -> str:
-    if pd.isna(symbol): return ""
+    if pd.isna(symbol):
+        return ""
     s = str(symbol).strip().lstrip("-")
     m = re.match(r"^([A-Z]+)", s)
     return m.group(1) if m else s
 
 
 def _parse_option_symbol(symbol: str) -> dict:
-    """
-    Parse '-NVDA260116P190' → {expiry: '2026-01-16', opt_type: 'PUT', strike: 190.0}
-    Also handles fractional strikes like '-NVDA251212P177.5'
-    """
     result = {"expiry": pd.NaT, "opt_type": None, "strike": None}
-    if pd.isna(symbol): return result
+    if pd.isna(symbol):
+        return result
     s = str(symbol).replace(" ", "").replace("-", "")
     m = re.search(r"(\d{6})([CP])(\d+\.?\d*)", s)
-    if not m: return result
+    if not m:
+        return result
     ds, cp, strike_s = m.group(1), m.group(2), m.group(3)
     try:
-        result["expiry"] = pd.Timestamp(
-            year=int("20" + ds[:2]), month=int(ds[2:4]), day=int(ds[4:6])
-        )
+        result["expiry"] = pd.Timestamp(year=int("20" + ds[:2]), month=int(ds[2:4]), day=int(ds[4:6]))
     except Exception:
         pass
     result["opt_type"] = "PUT" if cp == "P" else "CALL"
@@ -153,97 +61,234 @@ def _parse_option_symbol(symbol: str) -> dict:
     return result
 
 
-def _dte_category(dte: float) -> str:
-    if pd.isna(dte):   return "unknown"
-    if dte <= 7:        return "0-7 DTE"
-    if dte <= 14:       return "8-14 DTE"
-    if dte <= 45:       return "15-45 DTE"
-    if dte <= 90:       return "46-90 DTE"
-    if dte <= 180:      return "91-180 DTE"
-    if dte <= 365:      return "181-365 DTE"
-    return "365+ DTE"
-
-
-def _mode(opt_type: str, dte: float) -> str:
-    """
-    Classify trade mode based on option type and DTE at entry.
-    Mode A  = short-dated put (0-14 DTE) — IV fade / theta bleed
-    Mode B  = long-dated put (365+ DTE)  — quality at discount
-    Mode C  = structured income (15-364 DTE puts + most calls)
-    CC      = covered call written against a stock position
-    """
-    if pd.isna(opt_type) or pd.isna(dte):
-        return "unknown"
-    if opt_type == "PUT":
-        if dte <= 14:   return "A"
-        if dte >= 365:  return "B"
-        return "C"
+def _mode_closed(opt_type: str | None, ticker: str) -> str:
     if opt_type == "CALL":
-        return "CC"   # covered call / cap upside
-    return "unknown"
+        return "CC"
+    if opt_type == "PUT":
+        return "PUT"
+    return "STOCK"
 
 
-def _parse(df: pd.DataFrame) -> pd.DataFrame:
-    """Add all structured columns to the raw DataFrame."""
+def _parse_year_from_filename(path: Path) -> int | None:
+    m = re.search(r"(20\d{2})", path.name)
+    return int(m.group(1)) if m else None
 
-    # Dates
-    df["date"] = pd.to_datetime(df["Run Date"], errors="coerce")
 
-    # Numerics
-    for col in ["Price ($)", "Quantity", "Commission ($)", "Fees ($)",
-                 "Amount ($)", "Cash Balance ($)"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+def _read_lines(path: Path) -> list[str]:
+    with open(path, encoding="utf-8-sig", errors="replace") as f:
+        return f.readlines()
 
-    # Action classification
-    df["action_type"] = df["Action"].fillna("").apply(_categorize_action)
 
-    # Option type from Action text (more reliable than symbol for some rows)
-    df["opt_type_action"] = df["Action"].fillna("").apply(_get_opt_type)
+def _detect_format(path: Path) -> str:
+    lines = _read_lines(path)
+    head = "\n".join(lines[:6]).lower()
+    if "closed positions" in head:
+        return "closed_positions"
+    return "activity"
 
-    # Underlying ticker
-    df["ticker"] = df["Symbol"].apply(_extract_ticker)
 
-    # Sector
-    df["sector"] = df["ticker"].apply(get_sector)
+def _to_num(series: pd.Series) -> pd.Series:
+    s = (
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.replace("--", "", regex=False)
+        .str.strip()
+    )
+    s = s.replace({"": None, "None": None, "nan": None})
+    return pd.to_numeric(s, errors="coerce")
 
-    # Parse option symbol fields
-    sym_parsed = df["Symbol"].apply(_parse_option_symbol)
-    df["expiry"]   = sym_parsed.apply(lambda x: x["expiry"])
-    df["opt_type"] = sym_parsed.apply(lambda x: x["opt_type"])
-    df["strike"]   = sym_parsed.apply(lambda x: x["strike"])
 
-    # Fill opt_type from action text where symbol parse failed
-    mask = df["opt_type"].isna() & df["opt_type_action"].notna()
-    df.loc[mask, "opt_type"] = df.loc[mask, "opt_type_action"]
+def _load_closed_positions(path: Path) -> pd.DataFrame:
+    lines = _read_lines(path)
 
-    # DTE at entry
-    df["dte"] = (df["expiry"] - df["date"]).dt.days
-    df["dte_category"] = df["dte"].apply(_dte_category)
+    header_idx = next((i for i, l in enumerate(lines) if l.strip().startswith("Symbol,Quantity,")), None)
+    if header_idx is None:
+        raise ValueError(f"No closed-positions header found in {path}")
 
-    # Mode classification (only meaningful for SELL_OPEN)
-    df["mode"] = df.apply(
-        lambda r: _mode(r["opt_type"], r["dte"])
-        if r["action_type"] == "SELL_OPEN" else None,
-        axis=1,
+    footer_idx = next(
+        (i for i, l in enumerate(lines[header_idx + 1 :], start=header_idx + 1) if l.startswith("Totals,") or l.startswith("Disclosure")),
+        len(lines),
     )
 
-    # Is this a correction/cancellation entry?
-    df["is_correction"] = df["action_type"] == "CORRECTION"
+    csv_text = "".join(lines[header_idx:footer_idx])
+    df = pd.read_csv(StringIO(csv_text), dtype=str)
+    df = df.dropna(how="all")
 
-    # Year
-    df["year"] = df["date"].dt.year
+    rename_map = {
+        "$ Cost": "cost",
+        "$ Proceeds": "proceeds",
+        "$ Short-term G/L": "st_gl",
+        "$ Long-term G/L": "lt_gl",
+        "$ Total G/L": "total_gl",
+        "Avg Cost": "avg_cost",
+        "Avg Proceeds": "avg_proceeds",
+        "Last": "last",
+        "Account": "account",
+        "Description": "description",
+        "Quantity": "quantity",
+        "Symbol": "symbol",
+    }
+    df = df.rename(columns=rename_map)
+
+    for col in ["quantity", "cost", "proceeds", "st_gl", "lt_gl", "total_gl", "avg_cost", "avg_proceeds", "last"]:
+        if col in df.columns:
+            df[col] = _to_num(df[col])
+
+    df["symbol"] = df["symbol"].astype(str).str.strip()
+    df["ticker"] = df["symbol"].apply(_extract_ticker)
+    df["sector"] = df["ticker"].apply(get_sector)
+
+    sym = df["symbol"].apply(_parse_option_symbol)
+    df["expiry"] = sym.apply(lambda x: x["expiry"])
+    df["opt_type"] = sym.apply(lambda x: x["opt_type"])
+    df["strike"] = sym.apply(lambda x: x["strike"])
+
+    desc = df.get("description", pd.Series(index=df.index, dtype=str)).fillna("").str.upper()
+    df.loc[df["opt_type"].isna() & desc.str.contains(" PUT "), "opt_type"] = "PUT"
+    df.loc[df["opt_type"].isna() & desc.str.contains(" CALL "), "opt_type"] = "CALL"
+
+    file_year = _parse_year_from_filename(path)
+    df["year"] = file_year
+    df["date"] = pd.NaT
+    df["action_type"] = "CLOSED_POSITION"
+    df["is_correction"] = False
+    df["mode"] = df.apply(lambda r: _mode_closed(r.get("opt_type"), r.get("ticker")), axis=1)
+    df["dte"] = None
+    df["dte_category"] = None
+    df["source_file"] = path.name
+    df["dataset_type"] = "closed_positions"
 
     return df
 
 
-# ── Quick sanity check ─────────────────────────────────────────────────────────
+def _categorize_action(action: str) -> str:
+    a = str(action).upper()
+    if "CORR DESCRIPTION" in a or "CXL DESCRIPTION" in a:
+        return "CORRECTION"
+    if "SOLD OPENING" in a:
+        return "SELL_OPEN"
+    if "BOUGHT CLOSING" in a:
+        return "BUY_CLOSE"
+    if "BOUGHT OPENING" in a:
+        return "BUY_OPEN"
+    if "SOLD CLOSING" in a:
+        return "SELL_CLOSE"
+    if "EXPIRED" in a:
+        return "EXPIRED"
+    if "ASSIGNED" in a:
+        return "ASSIGNED"
+    if "YOU SOLD" in a:
+        return "STOCK_SELL"
+    if "YOU BOUGHT" in a:
+        return "STOCK_BUY"
+    return "OTHER"
+
+
+def _get_opt_type(action: str) -> str | None:
+    a = str(action).upper()
+    if " PUT " in a or a.endswith("PUT"):
+        return "PUT"
+    if " CALL " in a or a.endswith("CALL"):
+        return "CALL"
+    return None
+
+
+def _dte_category(dte: float) -> str:
+    if pd.isna(dte):
+        return "unknown"
+    if dte <= 7:
+        return "0-7 DTE"
+    if dte <= 14:
+        return "8-14 DTE"
+    if dte <= 45:
+        return "15-45 DTE"
+    if dte <= 90:
+        return "46-90 DTE"
+    if dte <= 180:
+        return "91-180 DTE"
+    if dte <= 365:
+        return "181-365 DTE"
+    return "365+ DTE"
+
+
+def _mode_activity(opt_type: str | None, dte: float) -> str:
+    if pd.isna(opt_type) or pd.isna(dte):
+        return "unknown"
+    if opt_type == "PUT":
+        if dte <= 14:
+            return "A"
+        if dte >= 365:
+            return "B"
+        return "C"
+    if opt_type == "CALL":
+        return "CC"
+    return "unknown"
+
+
+def _load_activity(path: Path) -> pd.DataFrame:
+    lines = _read_lines(path)
+    header_idx = next((i for i, l in enumerate(lines) if "Run Date" in l), None)
+    if header_idx is None:
+        raise ValueError(f"No 'Run Date' header found in {path}")
+
+    footer_idx = next((i for i, l in enumerate(lines) if "The data and information" in l), len(lines))
+    data = "".join(lines[header_idx:footer_idx])
+    df = pd.read_csv(StringIO(data), dtype=str)
+    df = df.dropna(how="all")
+    df = df[df["Run Date"].notna() & (df["Run Date"].astype(str).str.strip() != "")]
+
+    df["date"] = pd.to_datetime(df["Run Date"], errors="coerce")
+    for col in ["Price ($)", "Quantity", "Commission ($)", "Fees ($)", "Amount ($)", "Cash Balance ($)"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["action_type"] = df["Action"].fillna("").apply(_categorize_action)
+    df["opt_type_action"] = df["Action"].fillna("").apply(_get_opt_type)
+    df["ticker"] = df["Symbol"].apply(_extract_ticker)
+    df["sector"] = df["ticker"].apply(get_sector)
+
+    sym = df["Symbol"].apply(_parse_option_symbol)
+    df["expiry"] = sym.apply(lambda x: x["expiry"])
+    df["opt_type"] = sym.apply(lambda x: x["opt_type"])
+    df["strike"] = sym.apply(lambda x: x["strike"])
+
+    mask = df["opt_type"].isna() & df["opt_type_action"].notna()
+    df.loc[mask, "opt_type"] = df.loc[mask, "opt_type_action"]
+
+    df["dte"] = (df["expiry"] - df["date"]).dt.days
+    df["dte_category"] = df["dte"].apply(_dte_category)
+    df["mode"] = df.apply(lambda r: _mode_activity(r["opt_type"], r["dte"]) if r["action_type"] == "SELL_OPEN" else None, axis=1)
+    df["is_correction"] = df["action_type"] == "CORRECTION"
+    df["year"] = df["date"].dt.year
+    df["source_file"] = path.name
+    df["dataset_type"] = "activity"
+    return df
+
+
+def load_persona(persona: str, data_dir: str = "tradingData") -> pd.DataFrame:
+    root = Path(data_dir)
+    dirs = sorted([d for d in root.iterdir() if d.is_dir()]) if persona.lower() == "all" else [root / persona]
+
+    frames = []
+    for d in dirs:
+        if not d.exists():
+            print(f"  [WARN] Not found: {d}")
+            continue
+        for csv_path in sorted(d.glob("*.csv")):
+            print(f"  Loading {csv_path.relative_to(root)}")
+            fmt = _detect_format(csv_path)
+            raw = _load_closed_positions(csv_path) if fmt == "closed_positions" else _load_activity(csv_path)
+            raw["persona"] = d.name
+            frames.append(raw)
+
+    if not frames:
+        raise FileNotFoundError(f"No data loaded for persona '{persona}'")
+
+    return pd.concat(frames, ignore_index=True)
+
 
 if __name__ == "__main__":
-    df = load_persona("Arjuna", data_dir="tradingData")
-    print(f"\nTotal rows:   {len(df)}")
-    print(f"Action types:\n{df['action_type'].value_counts().to_string()}")
-    print(f"\nSell-open by mode:\n{df[df['action_type']=='SELL_OPEN']['mode'].value_counts().to_string()}")
-    print(f"\nYears: {sorted(df['year'].dropna().unique().astype(int).tolist())}")
-    print(f"\nTop tickers (sell_open):")
-    so = df[df["action_type"] == "SELL_OPEN"]
-    print(so["ticker"].value_counts().head(15).to_string())
+    df = load_persona("Arjuna")
+    print(df[["dataset_type", "source_file"]].value_counts().to_string())
+    print(df.head(3).to_string(index=False))
