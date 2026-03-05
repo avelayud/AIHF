@@ -1,5 +1,5 @@
 """
-core_strategies.py — Plain-English strategy groupings from closed trades.
+core_strategies.py — Distinct strategy definitions and metrics.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ RESOLVED = ["WIN", "LOSS", "EXPIRED_WIN"]
 
 
 def _pct(n, d):
-    return round(float(n / d * 100), 1) if d else None
+    return round(float(n / d * 100), 2) if d else None
 
 
 def summarize_core_strategies(trades: pd.DataFrame) -> pd.DataFrame:
@@ -23,39 +23,28 @@ def summarize_core_strategies(trades: pd.DataFrame) -> pd.DataFrame:
 
     defs = [
         {
-            "strategy_name": "Put Premium Engine",
-            "group": "Core Mode",
-            "definition": "Sell puts for premium income.",
-            "conditions": {"opt_type": "PUT"},
-            "mask": closed["opt_type"] == "PUT",
+            "strategy_name": "NVDA Wheel Engine",
+            "description": "Recurring NVDA short puts and covered calls for premium compounding.",
+            "conditions": {"ticker": "NVDA", "opt_type": ["PUT", "CALL"]},
+            "mask": (closed["ticker"] == "NVDA") & (closed["opt_type"].isin(["PUT", "CALL"])),
         },
         {
-            "strategy_name": "Covered Call Income",
-            "group": "Overlay",
-            "definition": "Write calls (CC) for income on held names.",
-            "conditions": {"opt_type": "CALL", "mode": "CC"},
-            "mask": closed["opt_type"] == "CALL",
+            "strategy_name": "Structured Income Puts",
+            "description": "Mid-duration premium selling (Mode C / 15-364 DTE puts).",
+            "conditions": {"mode": "C", "opt_type": "PUT"},
+            "mask": (closed["mode"] == "C") & (closed["opt_type"] == "PUT"),
         },
         {
-            "strategy_name": "Stock Position Closures",
-            "group": "Core Mode",
-            "definition": "Common stock trades closed for realized gain/loss.",
-            "conditions": {"mode": "STOCK"},
-            "mask": closed["mode"] == "STOCK",
+            "strategy_name": "Long-Dated Discount Entry Puts",
+            "description": "Far-dated cash-secured puts (Mode B / 365+ DTE) to get paid for long-term entry.",
+            "conditions": {"mode": "B", "opt_type": "PUT"},
+            "mask": (closed["mode"] == "B") & (closed["opt_type"] == "PUT"),
         },
         {
-            "strategy_name": "NVDA Core Engine",
-            "group": "Ticker Core",
-            "definition": "All NVDA closed trades across stock/options.",
-            "conditions": {"ticker": "NVDA"},
-            "mask": closed["ticker"] == "NVDA",
-        },
-        {
-            "strategy_name": "NVDA Put Premium",
-            "group": "Ticker Pattern",
-            "definition": "NVDA puts as the main recurring premium strategy.",
-            "conditions": {"ticker": "NVDA", "opt_type": "PUT"},
-            "mask": (closed["ticker"] == "NVDA") & (closed["opt_type"] == "PUT"),
+            "strategy_name": "Covered Call Overlay",
+            "description": "Call-writing overlay on held names to monetize upside caps.",
+            "conditions": {"mode": "CC", "opt_type": "CALL"},
+            "mask": (closed["mode"] == "CC") & (closed["opt_type"] == "CALL"),
         },
     ]
 
@@ -64,30 +53,23 @@ def summarize_core_strategies(trades: pd.DataFrame) -> pd.DataFrame:
         g = closed[d["mask"]].copy()
         if g.empty:
             continue
+        n = len(g)
         wins = int(g["won"].sum())
         rows.append(
             {
                 "strategy_name": d["strategy_name"],
-                "group": d["group"],
-                "definition": d["definition"],
+                "description": d["description"],
                 "conditions": d["conditions"],
-                "trades": int(len(g)),
-                "wins": wins,
-                "win_rate": _pct(wins, len(g)),
-                "premium": round(float(g["premium_collected"].sum()), 0),
-                "pnl": round(float(g["net_pnl"].sum()), 0),
-                "avg_pnl": round(float(g["net_pnl"].mean()), 2),
-                "avg_pnl_pct": round(float(g["pnl_pct"].mean()), 2) if g["pnl_pct"].notna().any() else None,
-                "avg_return_on_notional_pct": round(float(g["return_on_notional_pct"].mean()), 3)
+                "transactions": int(n),
+                "win_rate": _pct(wins, n),
+                "realized_pnl": round(float(g["net_pnl"].sum()), 0),
+                "premium_net": round(float(g["premium_collected"].sum() - g["cost_to_close"].fillna(0).sum()), 0),
+                "avg_return_pct": round(float(g["pnl_pct"].mean()), 2) if g["pnl_pct"].notna().any() else None,
+                "avg_notional_return_pct": round(float(g["return_on_notional_pct"].mean()), 3)
                 if g["return_on_notional_pct"].notna().any()
                 else None,
+                "avg_hold_days": round(float(g["hold_days"].mean()), 1) if g["hold_days"].notna().any() else None,
             }
         )
 
-    if not rows:
-        return pd.DataFrame()
-
-    out = pd.DataFrame(rows)
-    order = {"Core Mode": 0, "Overlay": 1, "Ticker Core": 2, "Ticker Pattern": 3}
-    out["_o"] = out["group"].map(order).fillna(9)
-    return out.sort_values(["_o", "premium"], ascending=[True, False]).drop(columns=["_o"]).reset_index(drop=True)
+    return pd.DataFrame(rows)

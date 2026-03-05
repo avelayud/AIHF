@@ -82,6 +82,9 @@ def _read_lines(path: Path) -> list[str]:
 def _detect_format(path: Path) -> str:
     lines = _read_lines(path)
     head = "\n".join(lines[:6]).lower()
+    first = lines[0].strip().lower() if lines else ""
+    if first.startswith("symbol(cusip),security description,date acquired,date sold,quantity,cost basis,proceeds"):
+        return "closed_lots"
     if "closed positions" in head:
         return "closed_positions"
     return "activity"
@@ -159,6 +162,87 @@ def _load_closed_positions(path: Path) -> pd.DataFrame:
     df["source_file"] = path.name
     df["dataset_type"] = "closed_positions"
 
+    return df
+
+
+def _mode_with_dte(opt_type: str | None, dte: float | None) -> str:
+    if opt_type == "CALL":
+        return "CC"
+    if opt_type == "PUT":
+        if pd.notna(dte):
+            if dte <= 14:
+                return "A"
+            if dte >= 365:
+                return "B"
+        return "C"
+    return "STOCK"
+
+
+def _load_closed_lots(path: Path) -> pd.DataFrame:
+    # Fidelity lot exports have a trailing comma on each row; restrict to declared columns.
+    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig", usecols=range(9))
+    df = df.dropna(how="all")
+
+    rename_map = {
+        "Symbol(CUSIP)": "symbol_cusip",
+        "Security Description": "description",
+        "Date Acquired": "date_acquired",
+        "Date Sold": "date_sold",
+        "Quantity": "quantity",
+        "Cost Basis": "cost",
+        "Proceeds": "proceeds",
+        "Short Term Gain/Loss": "st_gl",
+        "Long Term Gain/Loss": "lt_gl",
+    }
+    df = df.rename(columns=rename_map)
+
+    # Some Fidelity files include trailing empty columns from the row-ending comma.
+    for col in list(df.columns):
+        if str(col).startswith("Unnamed:"):
+            df = df.drop(columns=[col])
+
+    for col in ["quantity", "cost", "proceeds", "st_gl", "lt_gl"]:
+        if col in df.columns:
+            df[col] = _to_num(df[col])
+
+    df["date_acquired"] = pd.to_datetime(df.get("date_acquired"), errors="coerce", format="%Y-%m-%d")
+    df["date_sold"] = pd.to_datetime(df.get("date_sold"), errors="coerce", format="%Y-%m-%d")
+
+    symbol_raw = df.get("symbol_cusip", "").astype(str)
+    df["symbol"] = symbol_raw.str.replace(r"\(.*\)$", "", regex=True).str.strip()
+    df["ticker"] = df["symbol"].apply(_extract_ticker)
+    df["sector"] = df["ticker"].apply(get_sector)
+
+    sym = df["symbol"].apply(_parse_option_symbol)
+    df["expiry"] = sym.apply(lambda x: x["expiry"])
+    df["opt_type"] = sym.apply(lambda x: x["opt_type"])
+    df["strike"] = sym.apply(lambda x: x["strike"])
+
+    desc = df.get("description", pd.Series(index=df.index, dtype=str)).fillna("").str.upper()
+    df.loc[df["opt_type"].isna() & desc.str.contains(" PUT "), "opt_type"] = "PUT"
+    df.loc[df["opt_type"].isna() & desc.str.contains(" CALL "), "opt_type"] = "CALL"
+
+    df["entry_date"] = df[["date_acquired", "date_sold"]].min(axis=1)
+    df["close_date"] = df[["date_acquired", "date_sold"]].max(axis=1)
+    df["hold_days"] = (df["close_date"] - df["entry_date"]).dt.days
+    df["dte"] = (df["expiry"] - df["entry_date"]).dt.days
+    df["dte_category"] = df["dte"].apply(_dte_category)
+    df["mode"] = df.apply(lambda r: _mode_with_dte(r.get("opt_type"), r.get("dte")), axis=1)
+
+    total_gl = df.get("st_gl", 0).fillna(0) + df.get("lt_gl", 0).fillna(0)
+    df["total_gl"] = total_gl
+    df["row_kind"] = "TRADE"
+    df.loc[df["symbol_cusip"].isna() | (df["symbol_cusip"].astype(str).str.strip() == ""), "row_kind"] = "ADJUSTMENT"
+
+    year_from_close = df["close_date"].dt.year
+    file_year = _parse_year_from_filename(path)
+    df["year"] = year_from_close.fillna(file_year).astype("Int64")
+
+    df["date"] = df["close_date"]
+    df["action_type"] = "CLOSED_LOT"
+    df["is_correction"] = False
+    df["source_file"] = path.name
+    df["dataset_type"] = "closed_lots"
     return df
 
 
@@ -278,7 +362,12 @@ def load_persona(persona: str, data_dir: str = "tradingData") -> pd.DataFrame:
         for csv_path in sorted(d.glob("*.csv")):
             print(f"  Loading {csv_path.relative_to(root)}")
             fmt = _detect_format(csv_path)
-            raw = _load_closed_positions(csv_path) if fmt == "closed_positions" else _load_activity(csv_path)
+            if fmt == "closed_positions":
+                raw = _load_closed_positions(csv_path)
+            elif fmt == "closed_lots":
+                raw = _load_closed_lots(csv_path)
+            else:
+                raw = _load_activity(csv_path)
             raw["persona"] = d.name
             frames.append(raw)
 

@@ -14,7 +14,7 @@ Usage:
 Outputs:
     Prints summary tables to terminal.
     With --output csv: saves trades + stats to output/<persona>_<year>_*.csv
-    With --enrich: adds underlying/IV context columns from src/enricher.py
+    With --augment: adds underlying/IV context columns from src/augment_closed_lots.py
 """
 
 import argparse
@@ -46,8 +46,9 @@ def print_section(trades: pd.DataFrame, persona: str, year_filter: int | None):
         trades = trades[trades["year"] == year_filter]
 
     resolved = trades[trades["outcome"].isin(["WIN", "LOSS", "EXPIRED_WIN"])]
+    realized_rows = trades[trades["outcome"].isin(["WIN", "LOSS", "EXPIRED_WIN", "ADJUSTMENT"])]
     total_premium = resolved["premium_collected"].sum()
-    total_pnl = resolved["net_pnl"].sum()
+    total_pnl = realized_rows["net_pnl"].sum()
     n_resolved = len(resolved)
     wins = resolved["outcome"].isin(["WIN", "EXPIRED_WIN"]).sum()
     wr = wins / n_resolved * 100 if n_resolved else 0
@@ -57,11 +58,30 @@ def print_section(trades: pd.DataFrame, persona: str, year_filter: int | None):
     print(f"\n  {'Resolved option trades:':28} {n_resolved}")
     print(f"  {'Win rate (resolved only):':28} {wr:.1f}%")
     print(f"  {'Premium (resolved trades):':28} ${total_premium:,.0f}")
-    print(f"  {'Net P&L (resolved trades):':28} ${total_pnl:,.0f}")
+    print(f"  {'Realized G/L (incl adj):':28} ${total_pnl:,.0f}")
     print(f"  {'Avg return / trade:':28} {avg_trade_return:.2f}%")
     print(f"  {'Avg return on notional:':28} {avg_notional_return:.3f}%")
     print(f"  {'Open positions:':28} {(trades['outcome']=='OPEN').sum()}")
     print(f"  {'Assignments:':28} {(trades['outcome']=='ASSIGNED').sum()}")
+
+    print_header("BY POSITION EXPOSURE (INFERRED)")
+    t = resolved.copy()
+    def bucket(r):
+        if r.get("mode") == "STOCK":
+            return "assigned/longed_stock"
+        if r.get("opt_type") == "CALL":
+            return "covered_calls" if r.get("mode") == "CC" else "naked_calls"
+        if r.get("opt_type") == "PUT":
+            return "covered_puts" if (r.get("premium_collected") or 0) < (r.get("cost_to_close") or 0) else "naked_puts"
+        return "other"
+    t["bucket"] = t.apply(bucket, axis=1)
+    print(f"\n  {'Bucket':<24} {'Trades':>6} {'Win%':>7} {'Net P&L':>12} {'Avg Ret%':>10}")
+    print(f"  {'─'*24} {'─'*6} {'─'*7} {'─'*12} {'─'*10}")
+    for b, g in t.groupby("bucket"):
+        wr_b = g["outcome"].isin(["WIN", "EXPIRED_WIN"]).mean() * 100 if len(g) else 0
+        pnl_b = g["net_pnl"].sum()
+        avg_r = g["pnl_pct"].mean()
+        print(f"  {b:<24} {len(g):>6} {wr_b:>6.1f}% ${pnl_b:>11,.0f} {avg_r:>9.2f}")
 
     print_header("BY STRATEGY MODE")
     mode_stats = summarize(trades, ["mode"]).sort_values("total_premium", ascending=False)
@@ -89,14 +109,27 @@ def print_section(trades: pd.DataFrame, persona: str, year_filter: int | None):
         sector = str(r.get("sector", "")).replace("_", " ")
         print(f"  {str(r['ticker']):<8} {sector:<20} {int(r['total_trades']):>6}  {wr_s:>6}  ${r['total_premium']:>10,.0f}  {pnl_s:>12}")
 
-    print_header("BY YEAR")
-    year_stats = summarize(trades, ["year"]).sort_values("year")
-    print(f"\n  {'Year':<6} {'Trades':>7} {'Win%':>7} {'Premium':>12} {'Net P&L':>12}")
-    print(f"  {'─'*6} {'─'*7} {'─'*7} {'─'*12} {'─'*12}")
-    for _, r in year_stats.iterrows():
-        wr_s = f"{r['win_rate_pct']:.1f}%" if pd.notna(r["win_rate_pct"]) else "—"
-        pnl_s = f"${r['total_pnl']:,.0f}" if pd.notna(r["total_pnl"]) else "—"
-        print(f"  {int(r['year']):<6}  {int(r['total_trades']):>6}  {wr_s:>6}  ${r['total_premium']:>10,.0f}  {pnl_s:>12}")
+    print_header("BY YEAR (FIDELITY G/L)")
+    yr = (
+        trades.groupby("year", dropna=False)
+        .agg(
+            trades=("trade_id", "count"),
+            realized_gl=("total_gl", "sum"),
+            short_gl=("short_term_gl", "sum"),
+            long_gl=("long_term_gl", "sum"),
+        )
+        .reset_index()
+        .sort_values("year")
+    )
+    print(f"\n  {'Year':<6} {'Trades':>7} {'Realized G/L':>14} {'Short G/L':>14} {'Long G/L':>14}")
+    print(f"  {'─'*6} {'─'*7} {'─'*14} {'─'*14} {'─'*14}")
+    for _, r in yr.iterrows():
+        print(
+            f"  {int(r['year']):<6} {int(r['trades']):>7} "
+            f"${(r['realized_gl'] if pd.notna(r['realized_gl']) else 0):>13,.2f} "
+            f"${(r['short_gl'] if pd.notna(r['short_gl']) else 0):>13,.2f} "
+            f"${(r['long_gl'] if pd.notna(r['long_gl']) else 0):>13,.2f}"
+        )
 
     open_pos = trades[trades["outcome"] == "OPEN"]
     if len(open_pos):
@@ -186,7 +219,11 @@ def main():
     parser.add_argument("--output", choices=["csv"], default=None,
                         help="Save results to output/ directory")
     parser.add_argument("--enrich", action="store_true",
-                        help="Enrich trades with underlying price + IV context")
+                        help="(Deprecated) alias for --augment")
+    parser.add_argument("--augment", action="store_true",
+                        help="Augment closed-lot trades with underlying prices and IV")
+    parser.add_argument("--strategy-model", action="store_true",
+                        help="Build strategy model from augmented trades")
     parser.add_argument("--data-dir", default=DATA_DIR,
                         help=f"Root data directory (default: {DATA_DIR})")
     args = parser.parse_args()
@@ -196,9 +233,17 @@ def main():
         return
 
     trades, raw = analyze(args.persona, data_dir=args.data_dir)
-    if args.enrich:
-        from src.enricher import enrich
-        trades = enrich(trades)
+    if args.enrich or args.augment:
+        from src.augment_closed_lots import augment_trades
+        out_csv = str(OUTPUT_DIR / "augmented_trades.csv")
+        trades = augment_trades(trades, save_csv=out_csv, verbose=True)
+
+    if args.strategy_model:
+        from src.strategy_model import run_strategy_model
+        run_strategy_model(
+            augmented_csv=str(OUTPUT_DIR / "augmented_trades.csv"),
+            output_csv=str(OUTPUT_DIR / "strategy_model.csv"),
+        )
 
     print_section(trades, args.persona, args.year)
 

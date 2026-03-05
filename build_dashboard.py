@@ -1,8 +1,5 @@
 """
-build_dashboard.py — Generate dashboard.html from analysis outputs
-
-Run: python build_dashboard.py
-Output: output/dashboard.html — open directly in browser, no server needed
+build_dashboard.py — single-file analytics dashboard from closed-lot data.
 """
 
 from __future__ import annotations
@@ -16,9 +13,8 @@ from src.analyzer import analyze
 from src.core_strategies import summarize_core_strategies
 
 DATA_DIR = Path("tradingData")
-TRADE_OUTCOMES = ["WIN", "LOSS", "EXPIRED_WIN"]
-WIN_OUTCOMES = ["WIN", "EXPIRED_WIN"]
-CLOSED_PLUS_ASSIGNED = ["WIN", "LOSS", "EXPIRED_WIN", "ASSIGNED"]
+RESOLVED = ["WIN", "LOSS", "EXPIRED_WIN"]
+REALIZED = ["WIN", "LOSS", "EXPIRED_WIN", "ADJUSTMENT"]
 
 
 def has_persona_data(persona: str, data_dir: Path = DATA_DIR) -> bool:
@@ -26,537 +22,302 @@ def has_persona_data(persona: str, data_dir: Path = DATA_DIR) -> bool:
     return p.exists() and p.is_dir() and any(p.glob("*.csv"))
 
 
-def _safe_int(v):
-    return int(v) if pd.notna(v) else None
+def _records(df: pd.DataFrame) -> list[dict]:
+    return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
-def _safe_float(v):
-    return round(float(v), 2) if pd.notna(v) else None
+def _bucket(r: pd.Series) -> str:
+    if str(r.get("row_kind", "TRADE")).upper() == "ADJUSTMENT":
+        return "adjustment"
+    if r.get("mode") == "STOCK":
+        return "assigned_longed_stock"
+    if r.get("opt_type") == "CALL":
+        return "covered_calls" if r.get("mode") == "CC" else "naked_calls"
+    if r.get("opt_type") == "PUT":
+        return "covered_puts" if (r.get("premium_collected") or 0) < (r.get("cost_to_close") or 0) else "naked_puts"
+    return "other"
 
 
-def _prepare_closed(trades: pd.DataFrame) -> pd.DataFrame:
-    closed = trades[trades["outcome"].isin(TRADE_OUTCOMES)].copy()
-    closed["won"] = closed["outcome"].isin(WIN_OUTCOMES)
-    close_ref = closed["close_date"].where(closed["close_date"].notna(), closed["expiry_date"])
-    fallback_year_date = pd.to_datetime(closed["year"].astype("Int64").astype(str) + "-12-31", errors="coerce")
-    closed["pnl_date"] = close_ref.where(close_ref.notna(), closed["entry_date"]).where(
-        close_ref.notna() | closed["entry_date"].notna(), fallback_year_date
-    )
-    closed["month"] = closed["pnl_date"].dt.to_period("M").astype(str)
-    return closed
-
-
-def _get_persona_data(persona: str) -> dict:
+def _persona_data(persona: str) -> dict:
     trades, _ = analyze(persona)
-    closed = _prepare_closed(trades)
-    assigned = trades[trades["outcome"] == "ASSIGNED"].copy()
-    open_pos = trades[trades["outcome"] == "OPEN"].copy()
+    t = trades.copy()
+    t["bucket"] = t.apply(_bucket, axis=1)
+    t["close_date_use"] = t["close_date"].where(t["close_date"].notna(), t["entry_date"])
 
-    monthly = (
-        closed.groupby("month", as_index=False)
-        .agg(
-            premium=("premium_collected", "sum"),
-            net_pnl=("net_pnl", "sum"),
-            trades=("trade_id", "count"),
-            wins=("won", "sum"),
-        )
-        .sort_values("month")
-    )
-    monthly["win_rate"] = (monthly["wins"] / monthly["trades"] * 100).round(1)
-    monthly["premium"] = monthly["premium"].round(0)
-    monthly["net_pnl"] = monthly["net_pnl"].round(0)
-
-    by_mode = (
-        closed.groupby("mode", as_index=False)
-        .agg(
-            trades=("trade_id", "count"),
-            premium=("premium_collected", "sum"),
-            pnl=("net_pnl", "sum"),
-            wins=("won", "sum"),
-        )
-        .sort_values("premium", ascending=False)
-    )
-    by_mode["win_rate"] = (by_mode["wins"] / by_mode["trades"] * 100).round(1)
-    by_mode["premium"] = by_mode["premium"].round(0)
-    by_mode["pnl"] = by_mode["pnl"].round(0)
-
-    by_ticker = (
-        closed.groupby(["ticker", "sector"], as_index=False)
-        .agg(
-            trades=("trade_id", "count"),
-            premium=("premium_collected", "sum"),
-            pnl=("net_pnl", "sum"),
-            wins=("won", "sum"),
-        )
-        .sort_values("premium", ascending=False)
-        .head(20)
-    )
-    by_ticker["win_rate"] = (by_ticker["wins"] / by_ticker["trades"] * 100).round(1)
-    by_ticker["premium"] = by_ticker["premium"].round(0)
-    by_ticker["pnl"] = by_ticker["pnl"].round(0)
-
-    equity = (
-        closed.sort_values(["pnl_date", "entry_date"])
-        .groupby("pnl_date", as_index=False)
-        .agg(daily_pnl=("net_pnl", "sum"))
-    )
-    equity["cum_pnl"] = equity["daily_pnl"].cumsum().round(2)
-    equity["date"] = equity["pnl_date"].dt.strftime("%Y-%m-%d")
-
-    core = summarize_core_strategies(trades)
-    core_data = [] if core.empty else core.to_dict(orient="records")
-
-    trade_log = trades[trades["outcome"].isin(CLOSED_PLUS_ASSIGNED)].copy()
-    trade_log = trade_log[
-        [
-            "trade_id",
-            "year",
-            "ticker",
-            "mode",
-            "opt_type",
-            "strike",
-            "dte",
-            "contracts",
-            "entry_date",
-            "expiry_date",
-            "hold_days",
-            "premium_collected",
-            "cost_to_close",
-            "net_pnl",
-            "pnl_pct",
-            "return_on_notional_pct",
-            "outcome",
-        ]
+    cols = [
+        "trade_id",
+        "year",
+        "ticker",
+        "sector",
+        "mode",
+        "opt_type",
+        "strike",
+        "dte",
+        "contracts",
+        "entry_date",
+        "close_date",
+        "close_date_use",
+        "hold_days",
+        "premium_collected",
+        "cost_to_close",
+        "net_pnl",
+        "total_gl",
+        "short_term_gl",
+        "long_term_gl",
+        "pnl_pct",
+        "return_on_notional_pct",
+        "outcome",
+        "bucket",
+        "row_kind",
     ]
-    trade_log["entry_date"] = trade_log["entry_date"].dt.strftime("%Y-%m-%d")
-    trade_log["expiry_date"] = trade_log["expiry_date"].apply(lambda x: x.strftime("%Y-%m-%d") if pd.notna(x) else None)
-    trade_log["year"] = trade_log["year"].apply(_safe_int)
-    trade_log["dte"] = trade_log["dte"].apply(_safe_int)
+    out = t[cols].copy()
+    out["entry_date"] = out["entry_date"].dt.strftime("%Y-%m-%d")
+    out["close_date"] = out["close_date"].dt.strftime("%Y-%m-%d")
+    out["close_date_use"] = out["close_date_use"].dt.strftime("%Y-%m-%d")
 
-    summary = {
-        "resolved_trades": int(len(closed)),
-        "win_rate": round(float(closed["won"].mean() * 100), 1) if len(closed) else 0,
-        "premium": round(float(closed["premium_collected"].sum()), 0),
-        "net_pnl": round(float(closed["net_pnl"].sum()), 0),
-        "avg_trade_return_pct": round(float(closed["pnl_pct"].mean()), 2) if len(closed) else 0,
-        "avg_notional_return_pct": round(float(closed["return_on_notional_pct"].mean()), 3)
-        if len(closed) and closed["return_on_notional_pct"].notna().any()
-        else None,
-        "assigned": int(len(assigned)),
-        "open_positions": int(len(open_pos)),
-    }
-
-    open_json = []
-    for _, r in open_pos.iterrows():
-        open_json.append(
-            {
-                "ticker": r["ticker"],
-                "mode": str(r["mode"]),
-                "opt_type": str(r["opt_type"]),
-                "strike": _safe_float(r["strike"]),
-                "expiry_date": r["expiry_date"].strftime("%Y-%m-%d") if pd.notna(r["expiry_date"]) else None,
-                "contracts": _safe_int(r["contracts"]),
-                "premium_collected": _safe_float(r["premium_collected"]),
-            }
-        )
+    years = sorted([int(y) for y in out["year"].dropna().unique().tolist()])
+    strategies = summarize_core_strategies(t)
 
     return {
         "persona": persona,
-        "summary": summary,
-        "monthly": json.loads(monthly.to_json(orient="records")),
-        "modes": json.loads(by_mode.to_json(orient="records")),
-        "tickers": json.loads(by_ticker.to_json(orient="records")),
-        "equity": json.loads(equity[["date", "daily_pnl", "cum_pnl"]].to_json(orient="records")),
-        "strategies": core_data,
-        "trades": json.loads(trade_log.to_json(orient="records")),
-        "open": open_json,
-    }
-
-
-def _summary_row(trades: pd.DataFrame) -> dict:
-    closed = trades[trades["outcome"].isin(TRADE_OUTCOMES)].copy()
-    wins = closed["outcome"].isin(WIN_OUTCOMES).sum()
-    n = len(closed)
-    return {
-        "closed": int(n),
-        "win_rate": round(float((wins / n) * 100), 1) if n else 0,
-        "premium": round(float(closed["premium_collected"].sum()), 0),
-        "pnl": round(float(closed["net_pnl"].sum()), 0),
-    }
-
-
-def _mode_summary(trades: pd.DataFrame, mode: str) -> dict:
-    g = trades[(trades["mode"] == mode) & trades["outcome"].isin(TRADE_OUTCOMES)]
-    n = len(g)
-    wins = g["outcome"].isin(WIN_OUTCOMES).sum()
-    return {
-        "mode": mode,
-        "trades": int(n),
-        "win_rate": round(float((wins / n) * 100), 1) if n else 0,
-        "pnl": round(float(g["net_pnl"].sum()), 0),
-    }
-
-
-def _head_to_head() -> dict:
-    if not has_persona_data("Sundar"):
-        return {"status": "pending", "message": "Sundar data pending", "summary": {}, "modes": []}
-
-    try:
-        arjuna, _ = analyze("Arjuna")
-        sundar, _ = analyze("Sundar")
-    except FileNotFoundError:
-        return {"status": "pending", "message": "Sundar data pending", "summary": {}, "modes": []}
-
-    modes = []
-    mode_values = sorted(set(arjuna["mode"].dropna().unique().tolist() + sundar["mode"].dropna().unique().tolist()))
-    for m in mode_values:
-        a = _mode_summary(arjuna, m)
-        s = _mode_summary(sundar, m)
-        modes.append(
-            {
-                "mode": m,
-                "arjuna_trades": a["trades"],
-                "sundar_trades": s["trades"],
-                "arjuna_win_rate": a["win_rate"],
-                "sundar_win_rate": s["win_rate"],
-                "arjuna_pnl": a["pnl"],
-                "sundar_pnl": s["pnl"],
-            }
-        )
-
-    return {
-        "status": "ready",
-        "message": "Resolved option trades only (WIN/LOSS/EXPIRED_WIN). Assignments excluded from win rate.",
-        "summary": {"arjuna": _summary_row(arjuna), "sundar": _summary_row(sundar)},
-        "modes": modes,
+        "years": years,
+        "trades": _records(out),
+        "strategies": [] if strategies.empty else strategies.to_dict(orient="records"),
     }
 
 
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
-:root{--bg:#080c10;--surface:#0d1117;--card:#111820;--border:#1e2d3d;--accent:#00d4ff;--accent2:#00ff88;--accent3:#ff6b35;--warn:#ffaa00;--danger:#ff4466;--text:#e0eaf4;--muted:#5a7a94;--font-mono:'JetBrains Mono',monospace;--font-body:'Space Grotesk',sans-serif}
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:var(--font-body);min-height:100vh;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,212,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,.03) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0}
-.app{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:0 24px 40px}
-header{display:flex;align-items:center;justify-content:space-between;padding:24px 0 20px;border-bottom:1px solid var(--border);margin-bottom:20px;gap:12px;flex-wrap:wrap}
-.logo{display:flex;align-items:baseline;gap:10px}
-.logo-text{font-family:var(--font-mono);font-size:22px;font-weight:700;letter-spacing:4px;color:var(--accent)}
-.logo-sub{font-size:11px;color:var(--muted);letter-spacing:2px;text-transform:uppercase}
-.live-label{font-family:var(--font-mono);font-size:11px;color:var(--muted)}
-.nav{display:flex;gap:0;margin-bottom:14px;border-bottom:1px solid var(--border);overflow-x:auto;white-space:nowrap}
-.nav-tab{padding:10px 16px;font-size:12px;font-family:var(--font-mono);text-transform:uppercase;color:var(--muted);cursor:pointer;border:none;background:none;border-bottom:2px solid transparent;flex:0 0 auto}
-.nav-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
-.module-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px}
-.p-label{font-size:11px;color:var(--muted);font-family:var(--font-mono);text-transform:uppercase;letter-spacing:1px}
-.p-select,.filter-select,.filter-input{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:3px;font-family:var(--font-mono);font-size:11px}
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Grotesk:wght@300;400;500;700&display=swap');
+:root{--bg:#080c10;--card:#111820;--line:#1e2d3d;--muted:#5a7a94;--text:#e0eaf4;--a:#00d4ff;--g:#00ff88;--o:#ffaa00;--r:#ff4466}
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif}
+.app{max-width:1480px;margin:0 auto;padding:18px}
+header{display:flex;justify-content:space-between;align-items:end;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:12px}
+.logo{font:700 22px 'JetBrains Mono';letter-spacing:3px;color:var(--a)}
+.sub{font:11px 'JetBrains Mono';color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.nav{display:flex;gap:0;border-bottom:1px solid var(--line);overflow:auto;white-space:nowrap;margin-bottom:10px}
+.nav button{background:none;border:none;color:var(--muted);padding:10px 14px;font:500 12px 'JetBrains Mono';text-transform:uppercase;border-bottom:2px solid transparent;cursor:pointer}
+.nav button.active{color:var(--a);border-color:var(--a)}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+select,input{background:#0d1117;border:1px solid var(--line);color:var(--text);padding:6px 10px;border-radius:4px;font:11px 'JetBrains Mono'}
+.note{font-size:12px;color:var(--muted);line-height:1.45}
 .panel{display:none}.panel.active{display:block}
-.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
-.cards.head{grid-template-columns:repeat(4,1fr)}
-.card{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:14px;position:relative;overflow:hidden}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--accent);opacity:.6}
-.card.green::before{background:var(--accent2)}
-.card.warn::before{background:var(--warn)}
-.card.danger::before{background:var(--danger)}
-.card-label{font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1.4px;margin-bottom:8px}
-.card-value{font-family:var(--font-mono);font-size:22px}
-.card-sub{font-size:11px;color:var(--muted);margin-top:4px}
-.chart-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
-.chart-box{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:18px;min-width:0}
-.chart-title{font-family:var(--font-mono);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px}
-.canvas-wrap{height:220px;position:relative}
-.canvas-wrap.tall{height:280px}
-.table-scroll{overflow-x:auto}
-.data-table{width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:12px}
-.data-table th{text-align:left;padding:8px 10px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:1.2px;border-bottom:1px solid var(--border)}
-.data-table td{padding:9px 10px;border-bottom:1px solid rgba(30,45,61,.5);vertical-align:top}
-.badge{display:inline-block;padding:2px 8px;border-radius:2px;font-size:10px;border:1px solid transparent}
-.badge-A{background:rgba(0,212,255,.15);color:var(--accent);border-color:rgba(0,212,255,.4)}
-.badge-B{background:rgba(0,255,136,.15);color:var(--accent2);border-color:rgba(0,255,136,.4)}
-.badge-C{background:rgba(255,107,53,.15);color:var(--accent3);border-color:rgba(255,107,53,.4)}
-.badge-CC{background:rgba(255,170,0,.15);color:var(--warn);border-color:rgba(255,170,0,.4)}
-.badge-core{background:rgba(0,212,255,.12);color:var(--accent);border-color:rgba(0,212,255,.3)}
-.pos{color:var(--accent2)} .neg{color:var(--danger)}
-.filter-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-.pending-box{padding:20px;border:1px dashed var(--border);border-radius:4px;color:var(--muted);font-family:var(--font-mono);text-align:center}
-.notes{font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.5}
-.conditions{font-size:11px;color:var(--muted);max-width:380px;white-space:normal}
-@media(max-width:1000px){.cards,.cards.head{grid-template-columns:repeat(2,1fr)}.chart-grid-2{grid-template-columns:1fr}}
-@media(max-width:640px){.app{padding:0 12px 28px}.cards,.cards.head{grid-template-columns:1fr}.card-value{font-size:20px}}
+.cards{display:grid;grid-template-columns:repeat(7,1fr);gap:10px;margin-bottom:12px}
+.card{background:var(--card);border:1px solid var(--line);padding:12px;border-radius:4px}
+.k{font:10px 'JetBrains Mono';color:var(--muted);text-transform:uppercase;letter-spacing:1px}.v{font:700 20px 'JetBrains Mono';margin-top:5px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.box{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:14px;margin-bottom:12px}
+.title{font:11px 'JetBrains Mono';color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
+canvas{width:100%!important;height:255px!important}
+.table-wrap{overflow:auto}
+table{width:100%;border-collapse:collapse;font:12px 'JetBrains Mono'}th,td{padding:8px 9px;border-bottom:1px solid rgba(30,45,61,.6);text-align:left}th{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.pos{color:var(--g)}.neg{color:var(--r)}
+.badge{padding:2px 7px;border-radius:3px;border:1px solid var(--line);font:10px 'JetBrains Mono'}
+@media(max-width:1200px){.cards{grid-template-columns:repeat(3,1fr)}.grid2{grid-template-columns:1fr}}
+@media(max-width:700px){.cards{grid-template-columns:1fr}.app{padding:10px}}
 </style>
 """
 
 JS = r"""
 <script>
-let activePersona = 'Arjuna';
-let charts = {};
-const C={accent:'#00d4ff',green:'#00ff88',warn:'#ffaa00',danger:'#ff4466',muted:'#5a7a94'};
-const MC={A:'#00d4ff',B:'#00ff88',C:'#ff6b35',CC:'#ffaa00'};
+const RES=['WIN','LOSS','EXPIRED_WIN'];
+const REALIZED=['WIN','LOSS','EXPIRED_WIN','ADJUSTMENT'];
+const BUCKETS=['naked_calls','covered_calls','naked_puts','covered_puts','assigned_longed_stock'];
+const BCOL={naked_calls:'rgba(255,68,102,.6)',covered_calls:'rgba(255,170,0,.6)',naked_puts:'rgba(0,212,255,.6)',covered_puts:'rgba(0,255,136,.6)',assigned_longed_stock:'rgba(160,160,180,.6)'};
+let activePersona='Arjuna', activeYear='all', charts={};
 
-function showTab(id,btn){document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.nav-tab').forEach(b=>b.classList.remove('active'));document.getElementById('panel-'+id).classList.add('active');btn.classList.add('active');}
-function dc(id){if(charts[id]){charts[id].destroy();delete charts[id];}}
-function fmtUsd(v){return v==null?'—':'$'+Number(v).toLocaleString('en-US',{maximumFractionDigits:0});}
-function fmtPnl(v){if(v==null)return'—';const s=(v>=0?'+$':'-$')+Math.abs(v).toLocaleString('en-US',{maximumFractionDigits:0});return '<span class="'+(v>=0?'pos':'neg')+'">'+s+'</span>';}
+function fmtUsd(v){if(v==null||isNaN(v))return '—'; const a=Math.abs(v).toLocaleString('en-US',{maximumFractionDigits:2}); return (v>=0?'$':'-$')+a;}
+function fmtP(v){if(v==null||isNaN(v))return '—'; return Number(v).toFixed(2)+'%';}
+function pnl(v){if(v==null||isNaN(v))return '—'; return '<span class="'+(v>=0?'pos':'neg')+'">'+fmtUsd(v)+'</span>';}
+function dc(k){if(charts[k]){charts[k].destroy(); delete charts[k];}}
+function showTab(id,btn){document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));document.getElementById('panel-'+id).classList.add('active');btn.classList.add('active');renderAll();}
+function data(){return DATA[activePersona]||DATA['Arjuna'];}
+function allRows(){return data().trades.filter(r=>REALIZED.includes(r.outcome) && (activeYear==='all'||String(r.year)===activeYear));}
+function resolvedRows(){return allRows().filter(r=>RES.includes(r.outcome));}
 
-function onPersonaChange(){
-  const sel=document.getElementById('persona-select');
-  activePersona=sel.value;
-  renderAll(DATA[activePersona]||DATA['Arjuna']);
+function setPersona(){activePersona=document.getElementById('persona').value; populateYear(); renderAll();}
+function setYear(){activeYear=document.getElementById('year').value; renderAll();}
+function populateYear(){const d=data(); const s=document.getElementById('year'); const cur=activeYear; s.innerHTML='<option value="all">All Years</option>'+d.years.map(y=>'<option value="'+y+'">'+y+'</option>').join(''); activeYear=d.years.map(String).includes(cur)?cur:'all'; s.value=activeYear;}
+
+function baseMetrics(){
+  const ar=allRows(), rr=resolvedRows();
+  const realized=ar.reduce((a,r)=>a+(Number(r.total_gl??r.net_pnl)||0),0);
+  const st=ar.reduce((a,r)=>a+(Number(r.short_term_gl)||0),0);
+  const lt=ar.reduce((a,r)=>a+(Number(r.long_term_gl)||0),0);
+  const proceeds=rr.reduce((a,r)=>a+(Number(r.premium_collected)||0),0);
+  const spend=rr.reduce((a,r)=>a+(Number(r.cost_to_close)||0),0);
+  const wins=rr.filter(r=>r.outcome==='WIN'||r.outcome==='EXPIRED_WIN').length;
+  const avgRet=rr.length?rr.reduce((a,r)=>a+(Number(r.pnl_pct)||0),0)/rr.length:null;
+  return {realized,st,lt,proceeds,spend,netPrem:proceeds-spend,count:rr.length,wr:rr.length?wins/rr.length*100:0,avgRet};
 }
 
-function renderAll(d){
-  document.getElementById('s-trades').textContent=d.summary.resolved_trades;
-  document.getElementById('s-wr').textContent=d.summary.win_rate+'%';
-  document.getElementById('s-prem').textContent=fmtUsd(d.summary.premium);
-  document.getElementById('s-pnl').innerHTML=fmtPnl(d.summary.net_pnl);
-  document.getElementById('s-return').textContent=(d.summary.avg_trade_return_pct??0)+'%';
-  document.getElementById('metrics-note').textContent='Win rate = WIN or EXPIRED_WIN over resolved option trades. ASSIGNED is tracked separately ('+d.summary.assigned+').';
-  renderMonthly(d);renderModes(d);renderEquity(d);renderTickers(d);renderStrategies(d);renderTrades(d);renderPositions(d);populateTradeYears(d);populateModeFilter(d);
+function bucketLabel(b){return ({naked_calls:'Naked Calls',covered_calls:'Covered Calls',naked_puts:'Naked Puts',covered_puts:'Covered Puts',assigned_longed_stock:'Assigned / Longed Stock'})[b]||b;}
+
+function renderOverview(){
+  const m=baseMetrics();
+  document.getElementById('m-realized').innerHTML=pnl(m.realized);
+  document.getElementById('m-st').innerHTML=pnl(m.st);
+  document.getElementById('m-lt').innerHTML=pnl(m.lt);
+  document.getElementById('m-net').textContent=fmtUsd(m.netPrem);
+  document.getElementById('m-count').textContent=m.count;
+  document.getElementById('m-wr').textContent=m.wr.toFixed(1)+'%';
+  document.getElementById('m-ret').textContent=fmtP(m.avgRet);
+
+  const rr=resolvedRows();
+  document.getElementById('tbody-ex').innerHTML=BUCKETS.map(b=>{
+    const g=rr.filter(r=>r.bucket===b); const n=g.length; const wins=g.filter(x=>x.outcome==='WIN'||x.outcome==='EXPIRED_WIN').length;
+    const p=g.reduce((a,x)=>a+(Number(x.premium_collected)||0),0); const c=g.reduce((a,x)=>a+(Number(x.cost_to_close)||0),0); const pnlv=g.reduce((a,x)=>a+(Number(x.total_gl??x.net_pnl)||0),0); const avg=n?g.reduce((a,x)=>a+(Number(x.pnl_pct)||0),0)/n:null;
+    return '<tr><td>'+bucketLabel(b)+'</td><td>'+n+'</td><td>'+(n?(wins/n*100).toFixed(1):'0.0')+'%</td><td>'+fmtUsd(p)+'</td><td>'+fmtUsd(c)+'</td><td>'+pnl(pnlv)+'</td><td>'+fmtP(avg)+'</td></tr>';
+  }).join('');
+
+  // Color-coded stacked monthly by exposure buckets
+  const by={}; rr.forEach(r=>{const m=(r.close_date_use||'').slice(0,7); if(!m) return; if(!by[m]) by[m]={}; BUCKETS.forEach(b=>{if(by[m][b]==null)by[m][b]=0}); by[m][r.bucket]=(by[m][r.bucket]||0)+(Number(r.total_gl??r.net_pnl)||0);});
+  const months=Object.keys(by).sort();
+  dc('month'); charts.month=new Chart(document.getElementById('chart-month').getContext('2d'),{type:'bar',data:{labels:months,datasets:BUCKETS.map(b=>({label:bucketLabel(b),data:months.map(m=>by[m][b]||0),backgroundColor:BCOL[b]}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'}}}});
+
+  const eq={}; rr.forEach(r=>{const m=(r.close_date_use||'').slice(0,7); if(!m) return; eq[m]=(eq[m]||0)+(Number(r.total_gl??r.net_pnl)||0)}); const ms=Object.keys(eq).sort(); let c=0; const vals=ms.map(k=>(c+=eq[k]));
+  dc('eq'); charts.eq=new Chart(document.getElementById('chart-eq').getContext('2d'),{type:'line',data:{labels:ms,datasets:[{data:vals,borderColor:'#00d4ff',backgroundColor:'rgba(0,212,255,.12)',fill:true,pointRadius:0,tension:.2}]},options:{plugins:{legend:{display:false}},responsive:true,maintainAspectRatio:false}});
 }
 
-function renderMonthly(d){
-  dc('monthly');
-  charts.monthly=new Chart(document.getElementById('chart-monthly').getContext('2d'),{type:'bar',data:{labels:d.monthly.map(r=>r.month),datasets:[{data:d.monthly.map(r=>r.net_pnl),backgroundColor:d.monthly.map(r=>r.net_pnl>=0?'rgba(0,255,136,.45)':'rgba(255,68,102,.45)'),borderColor:d.monthly.map(r=>r.net_pnl>=0?C.green:C.danger),borderWidth:1}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:C.muted,font:{family:'JetBrains Mono',size:9}}},y:{ticks:{color:C.muted,font:{family:'JetBrains Mono',size:10},callback:v=>'$'+Number(v).toLocaleString()}}}}});
+function strategyDefs(){return [
+  {name:'NVDA Wheel Engine',desc:'Recurring NVDA short puts and covered calls.',fn:r=>r.ticker==='NVDA'&&['PUT','CALL'].includes(r.opt_type)},
+  {name:'Structured Income Puts',desc:'Mode C mid-duration puts (15-364 DTE).',fn:r=>r.mode==='C'&&r.opt_type==='PUT'},
+  {name:'Long-Dated Discount Entry Puts',desc:'Mode B 365+ DTE puts.',fn:r=>r.mode==='B'&&r.opt_type==='PUT'},
+  {name:'Covered Call Overlay',desc:'Mode CC call-writing on held positions.',fn:r=>r.mode==='CC'&&r.opt_type==='CALL'}
+];}
+
+function renderStrategies(){
+  const rows=resolvedRows();
+  const q=(document.getElementById('q-strat').value||'').toLowerCase();
+  const defs=strategyDefs().filter(s=>!q||(s.name+' '+s.desc).toLowerCase().includes(q));
+  const strat=defs.map(s=>{const g=rows.filter(s.fn);const n=g.length;const wins=g.filter(x=>x.outcome==='WIN'||x.outcome==='EXPIRED_WIN').length;const pnlv=g.reduce((a,x)=>a+(Number(x.total_gl??x.net_pnl)||0),0);const prem=g.reduce((a,x)=>a+((Number(x.premium_collected)||0)-(Number(x.cost_to_close)||0)),0);const avg=n?g.reduce((a,x)=>a+(Number(x.pnl_pct)||0),0)/n:null;const hold=n?g.reduce((a,x)=>a+(Number(x.hold_days)||0),0)/n:null;const dte=n?g.reduce((a,x)=>a+(Number(x.dte)||0),0)/n:null; return {s,g,n,wins,pnlv,prem,avg,hold,dte};});
+  document.getElementById('tbody-strat').innerHTML=strat.map(r=>'<tr><td><div>'+r.s.name+'</div><div class="note">'+r.s.desc+'</div></td><td>'+r.n+'</td><td>'+(r.n?(r.wins/r.n*100).toFixed(1):'0.0')+'%</td><td>'+fmtUsd(r.prem)+'</td><td>'+pnl(r.pnlv)+'</td><td>'+fmtP(r.avg)+'</td><td>'+(r.hold==null?'—':r.hold.toFixed(1))+'</td><td>'+(r.dte==null?'—':r.dte.toFixed(1))+'</td></tr>').join('');
+
+  // Return bands
+  const band=[{k:'<=-50%',f:v=>v<=-50},{k:'-50..0%',f:v=>v>-50&&v<=0},{k:'0..25%',f:v=>v>0&&v<=25},{k:'25..100%',f:v=>v>25&&v<=100},{k:'>100%',f:v=>v>100}];
+  document.getElementById('tbody-band').innerHTML=band.map(b=>{const g=rows.filter(r=>b.f(Number(r.pnl_pct)||0));const n=g.length;const w=g.filter(x=>x.outcome==='WIN'||x.outcome==='EXPIRED_WIN').length;const p=g.reduce((a,x)=>a+(Number(x.total_gl??x.net_pnl)||0),0);return '<tr><td>'+b.k+'</td><td>'+n+'</td><td>'+(n?(w/n*100).toFixed(1):'0.0')+'%</td><td>'+pnl(p)+'</td></tr>';}).join('');
+
+  // Top transactions (best/worst)
+  const sorted=[...rows].sort((a,b)=>(Number(b.total_gl??b.net_pnl)||0)-(Number(a.total_gl??a.net_pnl)||0));
+  const best=sorted.slice(0,10), worst=sorted.slice(-10).reverse();
+  document.getElementById('tbody-top').innerHTML=[...best,...worst].map(t=>'<tr><td>'+(t.close_date_use||'—')+'</td><td>'+t.ticker+'</td><td>'+t.mode+'</td><td>'+t.opt_type+'</td><td>$'+(t.strike??'—')+'</td><td>'+(t.dte??'—')+'</td><td>'+pnl(Number(t.total_gl??t.net_pnl)||0)+'</td><td>'+fmtP(t.pnl_pct)+'</td></tr>').join('');
+
+  // Strategy weighting chart
+  const labels=strat.map(r=>r.s.name), vals=strat.map(r=>r.prem);
+  dc('w'); charts.w=new Chart(document.getElementById('chart-weight').getContext('2d'),{type:'doughnut',data:{labels,datasets:[{data:vals,backgroundColor:['rgba(0,212,255,.7)','rgba(0,255,136,.7)','rgba(255,170,0,.7)','rgba(255,68,102,.7)']}]} ,options:{plugins:{legend:{position:'bottom'}},responsive:true,maintainAspectRatio:false}});
+
+  // Large stock shifts context (if augmented columns exist)
+  const shifts=rows.filter(r=>r.underlying_move_pct!=null && Math.abs(Number(r.underlying_move_pct))>=4);
+  document.getElementById('shift-note').textContent=shifts.length?('Large underlying move trades (|move|>=4%): '+shifts.length+' rows. Use augmented pipeline for full context.'):'No large-move context in current dataset. Run --augment to add underlying_move_pct/IV.';
 }
 
-function renderModes(d){
-  dc('modes');
-  charts.modes=new Chart(document.getElementById('chart-modes').getContext('2d'),{type:'bar',data:{labels:d.modes.map(r=>'Mode '+r.mode),datasets:[{data:d.modes.map(r=>r.win_rate),backgroundColor:d.modes.map(r=>MC[r.mode]||C.muted),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:C.muted,font:{family:'JetBrains Mono',size:10}}},y:{min:0,max:100,ticks:{color:C.muted,font:{family:'JetBrains Mono',size:10},callback:v=>v+'%'}}}}});
+function renderTickers(){
+  const rows=resolvedRows(); const m={}; rows.forEach(r=>{const k=r.ticker||'—'; if(!m[k])m[k]={t:k,s:r.sector||'other',n:0,w:0,p:0,pnl:0}; m[k].n++; if(r.outcome==='WIN'||r.outcome==='EXPIRED_WIN')m[k].w++; m[k].p+=(Number(r.premium_collected)||0); m[k].pnl+=(Number(r.total_gl??r.net_pnl)||0);});
+  const arr=Object.values(m).sort((a,b)=>b.p-a.p).slice(0,30);
+  document.getElementById('tbody-t').innerHTML=arr.map(r=>'<tr><td>'+r.t+'</td><td>'+r.s.replaceAll('_',' ')+'</td><td>'+r.n+'</td><td>'+(r.w/r.n*100).toFixed(1)+'%</td><td>'+fmtUsd(r.p)+'</td><td>'+pnl(r.pnl)+'</td></tr>').join('');
 }
 
-function renderEquity(d){
-  dc('equity');
-  charts.equity=new Chart(document.getElementById('chart-equity').getContext('2d'),{type:'line',data:{labels:d.equity.map(r=>r.date),datasets:[{data:d.equity.map(r=>r.cum_pnl),borderColor:C.accent,backgroundColor:'rgba(0,212,255,.08)',fill:true,pointRadius:0,tension:.15}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:C.muted,font:{family:'JetBrains Mono',size:9},maxRotation:45}},y:{ticks:{color:C.muted,font:{family:'JetBrains Mono',size:10},callback:v=>'$'+Number(v).toLocaleString()}}}}});
+function renderTrades(){
+  const rows=resolvedRows();
+  const md=document.getElementById('f-mode').value, out=document.getElementById('f-out').value;
+  const modes=[...new Set(rows.map(r=>r.mode).filter(Boolean))].sort(); const sel=document.getElementById('f-mode'); const cur=sel.value; sel.innerHTML='<option value="">All Modes</option>'+modes.map(m=>'<option value="'+m+'">'+m+'</option>').join(''); if(modes.includes(cur)) sel.value=cur;
+  const f=rows.filter(r=>(!md||r.mode===md)&&(!out||r.outcome===out));
+  document.getElementById('trade-count').textContent=f.length+' trades';
+  document.getElementById('tbody-tr').innerHTML=f.slice(0,600).map(t=>'<tr><td>'+(t.close_date_use||'—')+'</td><td>'+t.ticker+'</td><td>'+t.mode+'</td><td>'+t.opt_type+'</td><td>$'+(t.strike??'—')+'</td><td>'+(t.dte??'—')+'</td><td>'+(t.contracts??'—')+'</td><td>'+fmtUsd(t.premium_collected)+'</td><td>'+pnl(Number(t.total_gl??t.net_pnl)||0)+'</td><td>'+fmtP(t.pnl_pct)+'</td><td>'+(t.hold_days??'—')+'</td><td>'+t.outcome+'</td></tr>').join('');
 }
 
-function conditionsText(c){
-  if(!c)return '—';
-  return Object.entries(c).map(([k,v])=>k+'='+ (Array.isArray(v)?v.join('/') : String(v))).join(' · ');
+function renderHead(){
+  if(!DATA['Sundar']){document.getElementById('h2h').innerHTML='<div class="note">Sundar data pending.</div>';return;}
+  const y=activeYear;
+  const stat=n=>{const r=(DATA[n].trades||[]).filter(t=>RES.includes(t.outcome)&&(y==='all'||String(t.year)===y));const ntr=r.length,w=r.filter(x=>x.outcome==='WIN'||x.outcome==='EXPIRED_WIN').length,p=r.reduce((a,x)=>a+(Number(x.total_gl??x.net_pnl)||0),0);return {n:ntr,wr:ntr?w/ntr*100:0,p};};
+  const a=stat('Arjuna'), s=stat('Sundar');
+  document.getElementById('h2h').innerHTML='<table><tr><th>Persona</th><th>Trades</th><th>Win Rate</th><th>Realized G/L</th></tr><tr><td>Arjuna</td><td>'+a.n+'</td><td>'+a.wr.toFixed(1)+'%</td><td>'+pnl(a.p)+'</td></tr><tr><td>Sundar</td><td>'+s.n+'</td><td>'+s.wr.toFixed(1)+'%</td><td>'+pnl(s.p)+'</td></tr></table>';
 }
 
-function renderStrategies(d){
-  const q=(document.getElementById('f-strat-q').value||'').trim().toLowerCase();
-  const group=(document.getElementById('f-strat-group').value||'');
-  const rows=d.strategies.filter(s=>{
-    if(group && s.group!==group) return false;
-    if(!q) return true;
-    const blob=[s.strategy_name,s.group,s.definition,conditionsText(s.conditions)].join(' ').toLowerCase();
-    return blob.includes(q);
-  });
-  document.getElementById('strat-count').textContent=rows.length+' strategies';
-  if(!rows.length){document.getElementById('tbody-strat').innerHTML='<tr><td colspan="9" class="conditions">No strategy rows match current filters.</td></tr>';return;}
-  document.getElementById('tbody-strat').innerHTML=rows.map(s=>'<tr>'
-    +'<td><div>'+s.strategy_name+'</div><div class="conditions">'+s.definition+'</div></td>'
-    +'<td><span class="badge badge-core">'+s.group+'</span></td>'
-    +'<td>'+s.trades+'</td>'
-    +'<td>'+s.win_rate+'%</td>'
-    +'<td>'+fmtUsd(s.premium)+'</td>'
-    +'<td>'+fmtPnl(s.pnl)+'</td>'
-    +'<td>'+s.avg_pnl_pct+'%</td>'
-    +'<td>'+(s.avg_return_on_notional_pct==null?'—':s.avg_return_on_notional_pct+'%')+'</td>'
-    +'<td class="conditions">'+conditionsText(s.conditions)+'</td>'
-    +'</tr>').join('');
-}
+function renderAll(){renderOverview();renderStrategies();renderTickers();renderTrades();renderHead();}
 
-function filterStrategies(){renderStrategies(DATA[activePersona]||DATA['Arjuna']);}
-
-function renderTickers(d){
-  document.getElementById('tbody-tickers').innerHTML=d.tickers.map(r=>'<tr><td style="font-weight:600">'+r.ticker+'</td><td class="conditions">'+String(r.sector||'').replaceAll('_',' ')+'</td><td>'+r.trades+'</td><td>'+r.win_rate+'%</td><td>'+fmtUsd(r.premium)+'</td><td>'+fmtPnl(r.pnl)+'</td></tr>').join('');
-}
-
-function populateTradeYears(d){
-  const years=[...new Set(d.trades.map(t=>t.year).filter(Boolean))].sort((a,b)=>a-b);
-  const sel=document.getElementById('f-year');
-  const cur=sel.value;
-  sel.innerHTML='<option value="">All Years</option>'+years.map(y=>'<option value="'+y+'">'+y+'</option>').join('');
-  if(years.includes(Number(cur))) sel.value=cur;
-}
-
-function populateModeFilter(d){
-  const modes=[...new Set(d.trades.map(t=>t.mode).filter(Boolean))].sort();
-  const sel=document.getElementById('f-mode');
-  const cur=sel.value;
-  sel.innerHTML='<option value=\"\">All Modes</option>'+modes.map(m=>'<option value=\"'+m+'\">'+m+'</option>').join('');
-  if(modes.includes(cur)) sel.value=cur;
-}
-
-function renderTrades(d){
-  const mode=document.getElementById('f-mode').value;
-  const out=document.getElementById('f-out').value;
-  const yr=document.getElementById('f-year').value;
-  const rows=d.trades.filter(t=>(!mode||t.mode===mode)&&(!out||t.outcome===out)&&(!yr||String(t.year)===yr));
-  document.getElementById('trade-count').textContent=rows.length+' trades';
-  document.getElementById('tbody-trades').innerHTML=rows.slice(0,400).map(t=>'<tr>'
-    +'<td class="conditions">'+(t.entry_date||'—')+'</td><td style="font-weight:600">'+(t.ticker||'—')+'</td><td><span class="badge badge-'+(t.mode||'A')+'">'+(t.mode||'—')+'</span></td><td>'+(t.opt_type||'—')+'</td><td>$'+(t.strike||'—')+'</td><td>'+(t.dte??'—')+'</td><td>'+(t.contracts??'—')+'</td><td>'+fmtUsd(t.premium_collected)+'</td><td>'+fmtPnl(t.net_pnl)+'</td><td>'+(t.pnl_pct==null?'—':Number(t.pnl_pct).toFixed(1)+'%')+'</td><td>'+(t.return_on_notional_pct==null?'—':Number(t.return_on_notional_pct).toFixed(3)+'%')+'</td><td>'+(t.outcome||'—')+'</td></tr>').join('');
-}
-
-function filterTrades(){renderTrades(DATA[activePersona]||DATA['Arjuna']);}
-
-function renderPositions(d){
-  document.getElementById('tbody-pos').innerHTML=d.open.map(p=>'<tr><td style="font-weight:600">'+p.ticker+'</td><td>'+(p.mode||'—')+'</td><td>'+(p.opt_type||'—')+'</td><td>$'+(p.strike||'—')+'</td><td>'+(p.expiry_date||'—')+'</td><td>'+(p.contracts||'—')+'</td><td>'+fmtUsd(p.premium_collected)+'</td></tr>').join('');
-}
-
-function renderHeadToHead(){
-  const h=HEAD_TO_HEAD;
-  if(h.status!=='ready'){
-    document.getElementById('h2h-message').textContent='Sundar data pending';
-    document.getElementById('h2h-table').innerHTML='';
-    return;
-  }
-  document.getElementById('h2h-message').textContent=h.message;
-  document.getElementById('h2h-table').innerHTML='<table class="data-table"><thead><tr><th>Mode</th><th>Arjuna Trades</th><th>Sundar Trades</th><th>Arjuna Win%</th><th>Sundar Win%</th><th>Arjuna Net P&L</th><th>Sundar Net P&L</th></tr></thead><tbody>'
-  +h.modes.map(r=>'<tr><td><span class="badge badge-'+r.mode+'">'+r.mode+'</span></td><td>'+r.arjuna_trades+'</td><td>'+r.sundar_trades+'</td><td>'+r.arjuna_win_rate+'%</td><td>'+r.sundar_win_rate+'%</td><td>'+fmtPnl(r.arjuna_pnl)+'</td><td>'+fmtPnl(r.sundar_pnl)+'</td></tr>').join('')
-  +'</tbody></table>';
-}
-
-document.addEventListener('DOMContentLoaded',()=>{renderAll(DATA['Arjuna']);renderHeadToHead();});
+document.addEventListener('DOMContentLoaded',()=>{populateYear();renderAll();});
 </script>
 """
 
 BODY = """
 <div class="app">
-  <header>
-    <div class="logo"><span class="logo-text">AIHF</span><span class="logo-sub">Trading Analytics Module</span></div>
-    <span class="live-label">APR 2024 — MAR 2026</span>
-  </header>
-
+  <header><div><div class="logo">AIHF</div><div class="sub">Trading Analytics</div></div><div class="sub">Closed Lots + Fidelity G/L</div></header>
   <div class="nav">
-    <button class="nav-tab active" onclick="showTab('overview',this)">Overview</button>
-    <button class="nav-tab" onclick="showTab('strategies',this)">Core Strategies</button>
-    <button class="nav-tab" onclick="showTab('headtohead',this)">Head-to-Head</button>
-    <button class="nav-tab" onclick="showTab('tickers',this)">By Ticker</button>
-    <button class="nav-tab" onclick="showTab('trades',this)">Trade Log</button>
-    <button class="nav-tab" onclick="showTab('positions',this)">Open Positions</button>
+    <button class="active" onclick="showTab('overview',this)">Overview</button>
+    <button onclick="showTab('strategies',this)">Strategy Analysis</button>
+    <button onclick="showTab('head',this)">Head-to-Head</button>
+    <button onclick="showTab('tickers',this)">By Ticker</button>
+    <button onclick="showTab('trades',this)">Trade Log</button>
   </div>
-
-  <div class="module-toolbar">
-    <span class="p-label">Persona</span>
-    <select id="persona-select" class="p-select" onchange="onPersonaChange()">{PERSONA_OPTIONS}</select>
-    <span class="notes">This module treats personas as training datasets for strategy analytics.</span>
+  <div class="toolbar">
+    <span class="sub">Persona</span><select id="persona" onchange="setPersona()">{PERSONA_OPTIONS}</select>
+    <span class="sub">Year</span><select id="year" onchange="setYear()"></select>
+    <span class="note">Legend: A=Short-dated puts, B=Long-dated puts, C=Structured-income puts, CC=Covered calls, STOCK=long equity lots.</span>
   </div>
 
   <div id="panel-overview" class="panel active">
-    <div class="notes" id="metrics-note"></div>
     <div class="cards">
-      <div class="card"><div class="card-label">Resolved Trades</div><div class="card-value" id="s-trades">—</div><div class="card-sub">WIN/LOSS/EXPIRED_WIN</div></div>
-      <div class="card green"><div class="card-label">Win Rate</div><div class="card-value" id="s-wr">—</div><div class="card-sub">resolved only</div></div>
-      <div class="card"><div class="card-label">Premium Collected</div><div class="card-value" id="s-prem">—</div><div class="card-sub">resolved only</div></div>
-      <div class="card danger"><div class="card-label">Net P&L</div><div class="card-value" id="s-pnl">—</div><div class="card-sub">realized options only</div></div>
+      <div class="card"><div class="k">Realized G/L</div><div id="m-realized" class="v">—</div></div>
+      <div class="card"><div class="k">Short-term G/L</div><div id="m-st" class="v">—</div></div>
+      <div class="card"><div class="k">Long-term G/L</div><div id="m-lt" class="v">—</div></div>
+      <div class="card"><div class="k">Premium Net (Proceeds-Spend)</div><div id="m-net" class="v">—</div></div>
+      <div class="card"><div class="k">Trade Count</div><div id="m-count" class="v">—</div></div>
+      <div class="card"><div class="k">Win Rate</div><div id="m-wr" class="v">—</div></div>
+      <div class="card"><div class="k">Avg Return / Transaction</div><div id="m-ret" class="v">—</div></div>
     </div>
-    <div class="cards" style="grid-template-columns:repeat(2,1fr)">
-      <div class="card warn"><div class="card-label">Avg Return / Trade</div><div class="card-value" id="s-return">—</div><div class="card-sub">net_pnl / premium</div></div>
-      <div class="card"><div class="card-label">Truth Note</div><div class="card-sub">Assignments are excluded from P&L/win rate and shown separately in trade log.</div></div>
+    <div class="box"><div class="title">Exposure Split</div><div class="table-wrap"><table><thead><tr><th>Bucket</th><th>Transactions</th><th>Win Rate</th><th>Proceeds</th><th>Spend</th><th>Realized G/L</th><th>Avg Return</th></tr></thead><tbody id="tbody-ex"></tbody></table></div></div>
+    <div class="grid2">
+      <div class="box"><div class="title">Monthly Realized G/L by Exposure Bucket</div><canvas id="chart-month"></canvas></div>
+      <div class="box"><div class="title">Cumulative Equity Curve</div><canvas id="chart-eq"></canvas></div>
     </div>
-
-    <div class="chart-grid-2">
-      <div class="chart-box"><div class="chart-title">Monthly Net P&L</div><div class="canvas-wrap"><canvas id="chart-monthly"></canvas></div></div>
-      <div class="chart-box"><div class="chart-title">Win Rate by Mode</div><div class="canvas-wrap"><canvas id="chart-modes"></canvas></div></div>
-    </div>
-
-    <div class="chart-box"><div class="chart-title">Cumulative Net P&L Equity Curve</div><div class="canvas-wrap tall"><canvas id="chart-equity"></canvas></div></div>
   </div>
 
   <div id="panel-strategies" class="panel">
-    <div class="chart-box">
-      <div class="chart-title">Core Strategy Registry — <span id="strat-count"></span></div>
-      <div class="notes">Modes translated: A = short-dated puts, C = structured income puts (15-364 DTE), B = long-dated puts, CC = covered calls.</div>
-      <div class="filter-row">
-        <select id="f-strat-group" class="filter-select" onchange="filterStrategies()"><option value="">All Groups</option><option>Core Mode</option><option>Overlay</option><option>Ticker Core</option><option>Ticker Pattern</option></select>
-        <input id="f-strat-q" class="filter-input" oninput="filterStrategies()" placeholder="Filter by strategy/condition" />
-      </div>
-      <div class="table-scroll">
-        <table class="data-table">
-          <thead><tr><th>Strategy</th><th>Group</th><th>Trades</th><th>Win Rate</th><th>Premium</th><th>Net P&L</th><th>Avg P&L %</th><th>Avg Notional %</th><th>Conditions</th></tr></thead>
-          <tbody id="tbody-strat"></tbody>
-        </table>
-      </div>
+    <div class="box"><div class="title">Distinct Strategies (where worked vs failed)</div><div class="toolbar"><input id="q-strat" placeholder="Filter strategies" oninput="renderStrategies()"/></div><div class="table-wrap"><table><thead><tr><th>Strategy</th><th>Transactions</th><th>Win Rate</th><th>Premium Net</th><th>Realized G/L</th><th>Avg Return</th><th>Avg Hold Days</th><th>Avg DTE</th></tr></thead><tbody id="tbody-strat"></tbody></table></div></div>
+    <div class="grid2">
+      <div class="box"><div class="title">Return Bands</div><div class="table-wrap"><table><thead><tr><th>Band</th><th>Transactions</th><th>Win Rate</th><th>Realized G/L</th></tr></thead><tbody id="tbody-band"></tbody></table></div></div>
+      <div class="box"><div class="title">Strategy Weighting (Premium Net)</div><canvas id="chart-weight"></canvas></div>
     </div>
+    <div class="box"><div class="title">Top / Worst Transactions</div><div class="table-wrap"><table><thead><tr><th>Date</th><th>Ticker</th><th>Mode</th><th>Type</th><th>Strike</th><th>DTE</th><th>Realized G/L</th><th>Return</th></tr></thead><tbody id="tbody-top"></tbody></table></div><div id="shift-note" class="note"></div></div>
   </div>
 
-  <div id="panel-headtohead" class="panel">
-    <div class="chart-box">
-      <div class="chart-title">Arjuna vs Sundar</div>
-      <div class="notes" id="h2h-message">Sundar data pending</div>
-      <div class="table-scroll" id="h2h-table"></div>
-    </div>
-  </div>
-
-  <div id="panel-tickers" class="panel">
-    <div class="chart-box">
-      <div class="chart-title">Ticker Summary</div>
-      <div class="table-scroll"><table class="data-table"><thead><tr><th>Ticker</th><th>Sector</th><th>Trades</th><th>Win Rate</th><th>Premium</th><th>Net P&L</th></tr></thead><tbody id="tbody-tickers"></tbody></table></div>
-    </div>
-  </div>
-
-  <div id="panel-trades" class="panel">
-    <div class="chart-box">
-      <div class="chart-title">Trade Log — <span id="trade-count"></span></div>
-      <div class="filter-row">
-        <select id="f-mode" class="filter-select" onchange="filterTrades()"><option value="">All Modes</option><option>A</option><option>B</option><option>C</option><option>CC</option></select>
-        <select id="f-out" class="filter-select" onchange="filterTrades()"><option value="">All Outcomes</option><option>WIN</option><option>LOSS</option><option>EXPIRED_WIN</option><option>ASSIGNED</option></select>
-        <select id="f-year" class="filter-select" onchange="filterTrades()"><option value="">All Years</option></select>
-      </div>
-      <div class="table-scroll"><table class="data-table"><thead><tr><th>Date</th><th>Ticker</th><th>Mode</th><th>Type</th><th>Strike</th><th>DTE</th><th>Cts</th><th>Premium</th><th>Net P&L</th><th>P&L %</th><th>Notional %</th><th>Outcome</th></tr></thead><tbody id="tbody-trades"></tbody></table></div>
-    </div>
-  </div>
-
-  <div id="panel-positions" class="panel">
-    <div class="chart-box">
-      <div class="chart-title">Open Positions</div>
-      <div class="table-scroll"><table class="data-table"><thead><tr><th>Ticker</th><th>Mode</th><th>Type</th><th>Strike</th><th>Expiry</th><th>Contracts</th><th>Premium</th></tr></thead><tbody id="tbody-pos"></tbody></table></div>
-    </div>
-  </div>
+  <div id="panel-head" class="panel"><div class="box"><div class="title">Arjuna vs Sundar</div><div id="h2h"></div></div></div>
+  <div id="panel-tickers" class="panel"><div class="box"><div class="title">Ticker Summary</div><div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Sector</th><th>Transactions</th><th>Win Rate</th><th>Proceeds</th><th>Realized G/L</th></tr></thead><tbody id="tbody-t"></tbody></table></div></div></div>
+  <div id="panel-trades" class="panel"><div class="box"><div class="title">Trade Log — <span id="trade-count"></span></div><div class="toolbar"><select id="f-mode" onchange="renderTrades()"><option value="">All Modes</option></select><select id="f-out" onchange="renderTrades()"><option value="">All Outcomes</option><option>WIN</option><option>LOSS</option><option>EXPIRED_WIN</option></select></div><div class="table-wrap"><table><thead><tr><th>Date</th><th>Ticker</th><th>Mode</th><th>Type</th><th>Strike</th><th>DTE</th><th>Qty</th><th>Proceeds</th><th>Realized G/L</th><th>Return %</th><th>Hold Days</th><th>Outcome</th></tr></thead><tbody id="tbody-tr"></tbody></table></div></div></div>
 </div>
 """
 
 
 def build(output_path: str = "output/dashboard.html"):
     print("Loading data...")
-    data = {"Arjuna": _get_persona_data("Arjuna")}
+    data = {"Arjuna": _persona_data("Arjuna")}
+    opts = ["<option value='Arjuna'>Arjuna</option>"]
 
-    persona_options = ["<option value='Arjuna'>Arjuna</option>"]
     if has_persona_data("Sundar"):
         try:
-            data["Sundar"] = _get_persona_data("Sundar")
-            data["Combined"] = _get_persona_data("all")
-            persona_options.append("<option value='Sundar'>Sundar</option>")
-            persona_options.append("<option value='Combined'>Combined</option>")
+            data["Sundar"] = _persona_data("Sundar")
+            opts.append("<option value='Sundar'>Sundar</option>")
+            data["Combined"] = _persona_data("all")
+            opts.append("<option value='Combined'>Combined</option>")
         except FileNotFoundError:
             pass
 
-    head_to_head = _head_to_head()
-
-    body = BODY.replace("{PERSONA_OPTIONS}", "".join(persona_options))
-
-    print("Building HTML...")
-    Path(output_path).parent.mkdir(exist_ok=True)
-
-    data_js = (
-        f"<script>\nconst DATA = {json.dumps(data, default=str)};\n"
-        f"const HEAD_TO_HEAD = {json.dumps(head_to_head, default=str)};\n</script>\n"
-    )
-
     html = (
-        "<!DOCTYPE html>\n<html lang='en'>\n<head>\n"
-        "<meta charset='UTF-8'>\n"
-        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
-        "<title>AIHF — Trading Analytics</title>\n"
-        "<script src='https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js'></script>\n"
+        "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>AIHF Dashboard</title><script src='https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js'></script>"
         + CSS
-        + "\n</head>\n<body>\n"
-        + data_js
-        + body
+        + "</head><body><script>const DATA="
+        + json.dumps(data, default=str)
+        + ";</script>"
+        + BODY.replace("{PERSONA_OPTIONS}", "".join(opts))
         + JS
-        + "\n</body>\n</html>"
+        + "</body></html>"
     )
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    size_kb = Path(output_path).stat().st_size // 1024
-    print(f"  Written: {output_path} ({size_kb} KB)")
-    print(f"  Open in browser: open {output_path}")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_path).write_text(html, encoding="utf-8")
+    print(f"  Written: {output_path} ({Path(output_path).stat().st_size // 1024} KB)")
 
 
 if __name__ == "__main__":

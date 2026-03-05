@@ -37,6 +37,12 @@ def _fmt_pct(v: float | None, places: int = 1) -> str:
     return f"{v:.{places}f}%"
 
 
+def _fmt_num(v: float | None, places: int = 1) -> str:
+    if v is None or pd.isna(v):
+        return "—"
+    return f"{v:.{places}f}"
+
+
 def build_report(persona: str = "Arjuna") -> str:
     trades, _ = analyze(persona, data_dir=str(DATA_DIR))
     closed = trades[trades["outcome"].isin(TRADE_OUTCOMES)].copy()
@@ -116,7 +122,7 @@ def build_report(persona: str = "Arjuna") -> str:
         "",
         "## Core Strategy Breakdown",
         "",
-        "| Strategy | Group | Trades | Win Rate | Premium | Net P&L | Avg P&L % | Avg Notional % |",
+        "| Strategy | Transactions | Win Rate | Premium Net | Realized P&L | Avg Return % | Avg Notional % | Avg Hold Days |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
 
@@ -125,7 +131,7 @@ def build_report(persona: str = "Arjuna") -> str:
     else:
         for _, r in core.iterrows():
             lines.append(
-                f"| {r['strategy_name']} | {r['group']} | {int(r['trades'])} | {_fmt_pct(r['win_rate'])} | {_fmt_money(r['premium'])} | {_fmt_money(r['pnl'])} | {_fmt_pct(r['avg_pnl_pct'],2)} | {_fmt_pct(r['avg_return_on_notional_pct'],3)} |"
+                f"| {r['strategy_name']} | {int(r['transactions'])} | {_fmt_pct(r['win_rate'])} | {_fmt_money(r['premium_net'])} | {_fmt_money(r['realized_pnl'])} | {_fmt_pct(r['avg_return_pct'],2)} | {_fmt_pct(r['avg_notional_return_pct'],3)} | {_fmt_num(r['avg_hold_days'],1)} |"
             )
 
     lines += [

@@ -23,7 +23,8 @@ def _closed_positions_to_trades(df: pd.DataFrame) -> pd.DataFrame:
         qty = abs(float(row.get("quantity") or 1))
         cost = float(row.get("cost") or 0)
         proceeds = float(row.get("proceeds") or 0)
-        net_pnl = float(row.get("total_gl") or (proceeds - cost))
+        total_gl = float(row.get("total_gl") or (proceeds - cost))
+        net_pnl = total_gl
 
         base_notional = None
         if pd.notna(row.get("strike")):
@@ -31,13 +32,17 @@ def _closed_positions_to_trades(df: pd.DataFrame) -> pd.DataFrame:
         elif pd.notna(row.get("avg_cost")):
             base_notional = abs(float(row["avg_cost"]) * qty)
 
-        if pd.notna(row.get("year")):
+        entry_date = row.get("entry_date", pd.NaT)
+        close_date = row.get("close_date", pd.NaT)
+        if pd.isna(close_date) and pd.notna(row.get("year")):
             close_date = pd.Timestamp(year=int(row["year"]), month=12, day=31)
-        else:
-            close_date = pd.NaT
+        hold_days = (close_date - entry_date).days if pd.notna(close_date) and pd.notna(entry_date) else None
 
-        pnl_pct = (net_pnl / cost * 100) if cost else None
+        # Fidelity-style return on premium/proceeds for option-lot transactions.
+        pnl_pct = (net_pnl / proceeds * 100) if proceeds else None
         notional_ret = (net_pnl / base_notional * 100) if base_notional else None
+        row_kind = row.get("row_kind", "TRADE")
+        is_adjustment = str(row_kind).upper() == "ADJUSTMENT"
 
         records.append(
             {
@@ -49,27 +54,31 @@ def _closed_positions_to_trades(df: pd.DataFrame) -> pd.DataFrame:
                 "sector": row.get("sector"),
                 "mode": row.get("mode"),
                 "opt_type": row.get("opt_type"),
-                "dte_category": None,
-                "dte": None,
+                "dte_category": row.get("dte_category"),
+                "dte": row.get("dte"),
                 "strike": row.get("strike"),
                 "contracts": qty,
-                "entry_date": pd.NaT,
+                "entry_date": entry_date,
                 "expiry_date": row.get("expiry"),
                 "close_date": close_date,
-                "hold_days": None,
+                "hold_days": hold_days,
                 "close_type": "CLOSED_POSITION",
                 "premium_collected": proceeds,
                 "cost_to_close": cost,
                 "net_pnl": net_pnl,
                 "pnl_pct": pnl_pct,
-                "outcome": "WIN" if net_pnl >= 0 else "LOSS",
+                "outcome": "ADJUSTMENT" if is_adjustment else ("WIN" if net_pnl >= 0 else "LOSS"),
                 "entry_price": row.get("avg_cost"),
                 "close_price": row.get("avg_proceeds"),
                 "notional_at_entry": base_notional,
                 "return_on_notional_pct": notional_ret,
                 "raw_symbol": row.get("symbol"),
                 "description": row.get("description"),
-                "dataset_type": "closed_positions",
+                "dataset_type": row.get("dataset_type", "closed_positions"),
+                "short_term_gl": row.get("st_gl"),
+                "long_term_gl": row.get("lt_gl"),
+                "total_gl": total_gl,
+                "row_kind": row_kind,
             }
         )
 
@@ -278,7 +287,7 @@ def summarize(trades: pd.DataFrame, by: list[str]) -> pd.DataFrame:
 
 def analyze(persona: str = "Arjuna", data_dir: str = "tradingData") -> tuple[pd.DataFrame, pd.DataFrame]:
     raw = load_persona(persona, data_dir=data_dir)
-    if "dataset_type" in raw.columns and raw["dataset_type"].eq("closed_positions").all():
+    if "dataset_type" in raw.columns and raw["dataset_type"].isin(["closed_positions", "closed_lots"]).all():
         trades = _closed_positions_to_trades(raw)
     else:
         trades = _match_activity_trades(raw)
